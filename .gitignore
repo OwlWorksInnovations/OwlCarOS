@@ -1,0 +1,23 @@
+# Buildroot-generated files
+output/
+dl/
+.config
+.config.old
+.config.cmd
+*.depend
+
+# Generated disk images and filesystems
+*.img
+*.ext2
+*.ext4
+*.vfat
+*.tar
+*.fd
+bzImage
+BOOTX64.EFI
+bootx64.efi
+
+# Temporary files
+tmp/
+*.log
+buildroot/
