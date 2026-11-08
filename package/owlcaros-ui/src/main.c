@@ -1038,51 +1038,183 @@ static void media_poll(struct ui *ui)
     }
 }
 
+
+static int battery_percent(void)
+{
+    DIR *dir = opendir("/sys/class/power_supply");
+    struct dirent *entry;
+    int fallback = -1;
+
+    if (dir == NULL)
+        return -1;
+
+    while ((entry = readdir(dir)) != NULL) {
+        char type_path[160];
+        char capacity_path[160];
+        char type[32];
+        FILE *f;
+        int percent;
+
+        if (entry->d_name[0] == '.')
+            continue;
+
+        snprintf(type_path, sizeof(type_path),
+                 "/sys/class/power_supply/%s/type", entry->d_name);
+        f = fopen(type_path, "r");
+        if (f == NULL)
+            continue;
+        if (fgets(type, sizeof(type), f) == NULL) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        type[strcspn(type, "\r\n")] = '\0';
+
+        snprintf(capacity_path, sizeof(capacity_path),
+                 "/sys/class/power_supply/%s/capacity", entry->d_name);
+        f = fopen(capacity_path, "r");
+        if (f == NULL)
+            continue;
+        if (fscanf(f, "%d", &percent) == 1) {
+            fclose(f);
+            if (percent < 0 || percent > 100)
+                continue;
+            fallback = percent;
+            if (strcasecmp(type, "Battery") == 0) {
+                closedir(dir);
+                return percent;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+
+    closedir(dir);
+    return fallback;
+}
+
 static void draw_top_bar(struct fb *fb, int w, int h, uint32_t panel,
-                         uint32_t red, uint32_t red_bright, uint32_t orange)
+                         uint32_t red, uint32_t red_bright)
 {
     int top_h = imax(h / 12, 40);
-    int scale = iclamp(w / 420, 2, 4);
-    char clockbuf[16];
-    time_t now = time(NULL);
-    struct tm tm_now;
+    int scale = iclamp(w / 420, 2, 3);
+    int y = (top_h - 7 * scale) / 2;
+    int margin = imax(w / 64, 12);
+    const char *left = "MEMORY";
+    const char *center = "OWLCAROS";
+    const char *right = "SYSTEM";
 
     fill_rect(fb, 0, 0, w, top_h, panel);
     fill_rect(fb, 0, top_h - 2, w, 2, red);
 
-    draw_text(fb, imax(w / 64, 12), (top_h - 7 * scale) / 2, "OWLCAROS",
-              scale, red_bright);
+    draw_text(fb, margin, y, left, scale, red);
+    draw_text_centered(fb, 0, y, w, center, scale, red_bright);
+    draw_text(fb, w - margin - text_width(right, scale), y, right, scale, red);
+}
 
-    localtime_r(&now, &tm_now);
-    strftime(clockbuf, sizeof(clockbuf), "%H:%M", &tm_now);
-    draw_text(fb, w - imax(w / 64, 12) - text_width(clockbuf, scale),
-              (top_h - 7 * scale) / 2, clockbuf, scale, orange);
+
+static void draw_battery_icon(struct fb *fb, int x, int y, int scale,
+                              int percent, uint32_t outline, uint32_t fill)
+{
+    int body_w = 14 * scale;
+    int body_h = 8 * scale;
+    int border = scale;
+    int inner_w = body_w - 2 * border;
+    int inner_h = body_h - 2 * border;
+
+    fill_rect(fb, x, y, body_w, border, outline);
+    fill_rect(fb, x, y + body_h - border, body_w, border, outline);
+    fill_rect(fb, x, y, border, body_h, outline);
+    fill_rect(fb, x + body_w - border, y, border, body_h, outline);
+    fill_rect(fb, x + body_w, y + body_h / 3, 2 * scale,
+              imax(body_h / 3, scale), outline);
+
+    if (percent >= 0 && inner_w > 0 && inner_h > 0) {
+        int fill_w = inner_w * percent / 100;
+
+        if (fill_w > 0)
+            fill_rect(fb, x + border, y + border, fill_w, inner_h, fill);
+    }
 }
 
 static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
                             uint32_t panel, uint32_t red, uint32_t red_dim)
 {
     const struct media *m = &ui->media;
+    const char *left = ui->screen == SCREEN_MEDIA ? "TUNING" : "MENU";
+    char sound[32];
+    char clockbuf[16];
+    char batterybuf[8];
     int bottom_h = imax(h / 18, 26);
-    int scale = iclamp(w / 1280, 1, 2);
-    char status[192];
-    int bt_on;
-    int sy;
+    int scale = iclamp(w / 360, 1, 2);
+    int margin = imax(w / 64, 12);
+    int sy = h - bottom_h + (bottom_h - 7 * scale) / 2;
+    time_t now = time(NULL);
+    struct tm tm_now;
+    int percent = battery_percent();
+    int clock_w;
+    int battery_w;
+    int icon_w = 16 * scale;
+    int group_w;
+    int group_x;
+    int icon_y;
 
-    bt_on = bt_adapter_present();
+    if (m->muted)
+        snprintf(sound, sizeof(sound), "SOUND MUTE");
+    else
+        snprintf(sound, sizeof(sound), "SOUND %d", m->volume);
 
-    snprintf(status, sizeof(status),
-             "BT %s   |   WIFI OFF   |   VOL %s%3d   |   %s",
-             bt_on ? "ON " : "OFF",
-             m->muted ? "MUTE " : "",
-             m->volume,
-             ui->status[0] ? ui->status : "READY");
+    localtime_r(&now, &tm_now);
+    strftime(clockbuf, sizeof(clockbuf), "%H:%M", &tm_now);
+    if (percent >= 0)
+        snprintf(batterybuf, sizeof(batterybuf), "%d%%", percent);
+    else
+        snprintf(batterybuf, sizeof(batterybuf), "--%%");
 
     fill_rect(fb, 0, h - bottom_h, w, bottom_h, panel);
     fill_rect(fb, 0, h - bottom_h, w, 2, red);
 
-    sy = h - bottom_h + (bottom_h - 7 * scale) / 2;
-    draw_text(fb, imax(w / 64, 12), sy, status, scale, red_dim);
+    clock_w = text_width(clockbuf, scale);
+    battery_w = text_width(batterybuf, scale);
+    group_w = clock_w + 5 * scale + icon_w + 3 * scale + battery_w;
+    group_x = (w - group_w) / 2;
+    icon_y = h - bottom_h + (bottom_h - 8 * scale) / 2;
+
+    draw_text(fb, margin, sy, left, scale, red_dim);
+    draw_text(fb, group_x, sy, clockbuf, scale,
+              color_pack(fb, 0xF4E3DC));
+    draw_battery_icon(fb, group_x + clock_w + 5 * scale, icon_y, scale,
+                      percent, red_dim, red);
+    draw_text(fb, group_x + clock_w + 5 * scale + icon_w + 3 * scale,
+              sy, batterybuf, scale, red);
+    draw_text(fb, w - margin - text_width(sound, scale), sy, sound, scale,
+              red_dim);
+}
+
+
+static void draw_line(struct fb *fb, int x0, int y0, int x1, int y1,
+                      uint32_t color)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        fill_rect(fb, x0, y0, 1, 1, color);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
 }
 
 static void draw_home(struct ui *ui)
@@ -1100,70 +1232,91 @@ static void draw_home(struct ui *ui)
     const uint32_t c_glow_sel = color_pack(fb, 0x4A0500);
     const uint32_t c_text = color_pack(fb, 0xF4E3DC);
     const uint32_t c_text_dim = color_pack(fb, 0x9A5F57);
-    const uint32_t c_orange = color_pack(fb, 0xFF4D00);
     const int top_h = imax(h / 12, 40);
     const int bottom_h = imax(h / 18, 26);
     const int margin = imax(w / 64, 12);
-    const int gap = imax(w / 128, 8);
+    const int panel_x = margin;
+    const int panel_y = top_h + margin / 2;
+    const int panel_w = imax(w - 2 * margin, 1);
+    const int panel_h = imax(h - panel_y - bottom_h - margin / 2, 1);
+    const int title_scale = iclamp(w / 420, 2, 3);
+    const int label_scale = iclamp(w / 480, 2, 3);
+    const int title_h = 7 * title_scale + 22;
+    const int hint_h = 7 + 12;
+    const int list_y = panel_y + title_h;
+    const int list_h = imax(panel_h - title_h - hint_h, 1);
+    const int row_h = imax(list_h / 4, 1);
+    const int pad = imax(w / 64, 14);
 
     static const uint16_t *const icons[4] = {
         icon_media, icon_navigation, icon_phone, icon_settings
     };
-    static const char *const tiles[4] = {
+    static const char *const titles[4] = {
         "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
     };
-    static const char *const subtitles[4] = {
-        "AUDIO / BLUETOOTH", "MAPS & ROUTES", "HANDS-FREE", "SYSTEM"
+    static const char *const details[4] = {
+        "BLUETOOTH AND LOCAL AUDIO", "MAPS AND ROUTES",
+        "HANDS-FREE", "SYSTEM"
     };
 
     fill_rect(fb, 0, 0, w, h, c_bg);
-    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright, c_orange);
+    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
 
-    int area_y = top_h + margin;
-    int area_h = h - top_h - bottom_h - 2 * margin;
-    int tile_w = (w - 2 * margin - gap) / 2;
-    int tile_h = (area_h - gap) / 2;
-    int label_scale = iclamp(w / 320, 2, 5);
-    int sub_scale = 2;
+    /* Framed, two-tone list layout inspired by a classic car-radio display. */
+    fill_rect(fb, panel_x, panel_y, panel_w, panel_h, c_panel);
+    fill_rect(fb, panel_x, panel_y, panel_w, 2, c_red);
+    fill_rect(fb, panel_x, panel_y + panel_h - 2, panel_w, 2, c_red_dim);
+    fill_rect(fb, panel_x, panel_y, 2, panel_h, c_red_dim);
+    fill_rect(fb, panel_x + panel_w - 2, panel_y, 2, panel_h, c_red_dim);
+
+    draw_text_centered(fb, panel_x, panel_y + 7, panel_w, "SELECT A MODE",
+                       title_scale, c_red_bright);
+    fill_rect(fb, panel_x + 8, list_y - 4, panel_w - 16, 1, c_red_dim);
 
     for (int i = 0; i < 4; i++) {
-        int tx = margin + (i % 2) * (tile_w + gap);
-        int ty = area_y + (i / 2) * (tile_h + gap);
-        int selected = (i == ui->selected);
-        uint32_t border = selected ? c_red_bright : c_red_dim;
-        uint32_t icon_on = selected ? c_red_bright : c_red;
-        uint32_t icon_glow = selected ? c_glow_sel : c_glow;
-        int dot = iclamp(tile_h / 9, 3, 7);
+        int y = list_y + i * row_h;
+        int selected = i == ui->selected;
+        int dot = iclamp(row_h / 24, 1, 2);
         int icon_px = 16 * dot;
-        int lh = 7 * label_scale;
-        int sub_h = 7 * sub_scale;
-        int block_h = icon_px + 18 + lh + 10 + sub_h;
-        int by = ty + (tile_h - block_h) / 2;
-        int ix = tx + (tile_w - icon_px) / 2;
-
-        fill_rect(fb, tx, ty, tile_w, tile_h,
-                  selected ? c_panel_sel : c_panel);
-        fill_rect(fb, tx, ty, tile_w, 2, border);
-        fill_rect(fb, tx, ty + tile_h - 2, tile_w, 2, border);
-        fill_rect(fb, tx, ty, 2, tile_h, border);
-        fill_rect(fb, tx + tile_w - 2, ty, 2, tile_h, border);
-
-        draw_icon(fb, ix, by, dot, icons[i], icon_on, icon_glow);
-
-        draw_text_centered(fb, tx, by + icon_px + 18, tile_w, tiles[i],
-                           label_scale, selected ? c_red_bright : c_text);
-        draw_text_centered(fb, tx, by + icon_px + 18 + lh + 10, tile_w,
-                           subtitles[i], sub_scale,
-                           selected ? c_text_dim : c_red_dim);
+        int text_x = panel_x + pad + icon_px + imax(w / 96, 8);
+        int text_w = panel_x + panel_w - pad - text_x;
+        int text_block_h = 7 * label_scale + 10;
+        int text_y = y + (row_h - text_block_h) / 2;
+        uint32_t icon_on = selected ? c_red_bright : c_red_dim;
+        uint32_t icon_glow = selected ? c_glow_sel : c_glow;
 
         if (selected) {
-            int bar_w = imax(tile_w / 6, 24);
-
-            fill_rect(fb, tx + (tile_w - bar_w) / 2, ty + tile_h - 20,
-                      bar_w, 3, c_orange);
+            fill_rect(fb, panel_x + 4, y + 1, panel_w - 8, row_h - 2,
+                      c_panel_sel);
+            fill_rect(fb, panel_x + 4, y + 1, 3, row_h - 2, c_red_bright);
+            fill_rect(fb, panel_x + panel_w - 7, y + 1, 3, row_h - 2,
+                      c_red);
+        } else if (i > 0) {
+            fill_rect(fb, panel_x + 12, y, panel_w - 24, 1, c_red_dim);
         }
+
+        if (i == 1) {
+            draw_line(fb, panel_x + 10, y + 4, panel_x + 5, y + row_h / 2,
+                      c_red_dim);
+            draw_line(fb, panel_x + 5, y + row_h / 2,
+                      panel_x + 10, y + row_h - 5, c_red_dim);
+            draw_line(fb, panel_x + panel_w - 10, y + 4,
+                      panel_x + panel_w - 5, y + row_h / 2, c_red_dim);
+            draw_line(fb, panel_x + panel_w - 5, y + row_h / 2,
+                      panel_x + panel_w - 10, y + row_h - 5, c_red_dim);
+        }
+
+        draw_icon(fb, panel_x + pad, y + (row_h - icon_px) / 2, dot,
+                  icons[i], icon_on, icon_glow);
+        draw_text_ellipsis(fb, text_x, text_y, text_w, titles[i],
+                           label_scale, selected ? c_red_bright : c_text);
+        draw_text_ellipsis(fb, text_x, text_y + 7 * label_scale + 3,
+                           text_w, details[i], 1,
+                           selected ? c_text_dim : c_red_dim);
     }
 
+    draw_text_centered(fb, panel_x, panel_y + panel_h - hint_h + 2,
+                       panel_w, "UP/DOWN SELECT   ENTER OPEN", 1, c_red_dim);
     draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
 }
 
@@ -1270,7 +1423,7 @@ static void draw_media(struct ui *ui)
     int rx = margin + left_w + gap;
 
     fill_rect(fb, 0, 0, w, h, c_bg);
-    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright, c_orange);
+    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
 
     if (m->source == SRC_LOCAL && m->local_index >= 0
         && m->local_index < m->track_count) {
@@ -1448,6 +1601,7 @@ static int handle_global_key(struct ui *ui, int code)
     }
 }
 
+
 static void handle_home_key(struct ui *ui, int code, int *dirty)
 {
     static const char *const names[4] = {
@@ -1456,23 +1610,13 @@ static void handle_home_key(struct ui *ui, int code, int *dirty)
 
     switch (code) {
     case KEY_LEFT:
-        if (ui->selected % 2 == 1)
-            ui->selected--;
+    case KEY_UP:
+        ui->selected = ui->selected > 0 ? ui->selected - 1 : 3;
         *dirty = 1;
         break;
     case KEY_RIGHT:
-        if (ui->selected % 2 == 0)
-            ui->selected++;
-        *dirty = 1;
-        break;
-    case KEY_UP:
-        if (ui->selected >= 2)
-            ui->selected -= 2;
-        *dirty = 1;
-        break;
     case KEY_DOWN:
-        if (ui->selected < 2)
-            ui->selected += 2;
+        ui->selected = ui->selected < 3 ? ui->selected + 1 : 0;
         *dirty = 1;
         break;
     case KEY_ENTER:

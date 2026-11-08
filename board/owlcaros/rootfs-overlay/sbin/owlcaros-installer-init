@@ -1,0 +1,196 @@
+#!/bin/sh
+# Guided whole-disk installer for OwlCarOS.
+# The boot disk is detected and excluded from the target list.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+set -u
+
+SOURCE_MNT=/run/owlcaros-source-boot
+TARGET_MNT=/run/owlcaros-target-boot
+DISK_LIST=/run/owlcaros-target-disks
+
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p "$SOURCE_MNT" "$TARGET_MNT"
+
+cleanup() {
+    if grep -q " $TARGET_MNT " /proc/mounts 2>/dev/null; then
+        umount "$TARGET_MNT" 2>/dev/null || true
+    fi
+    if grep -q " $SOURCE_MNT " /proc/mounts 2>/dev/null; then
+        umount "$SOURCE_MNT" 2>/dev/null || true
+    fi
+}
+
+console_shell() {
+    cleanup
+    echo
+    echo "Installer stopped. No further disk changes will be made."
+    echo "You can inspect the console or power off."
+    echo
+    exec /bin/sh -i </dev/console >/dev/console 2>&1
+}
+
+fail() {
+    echo
+    printf 'INSTALLER ERROR: %s\n' "$1"
+    console_shell
+}
+
+echo
+echo "============================================================"
+echo "                 OWLCAROS INSTALLER"
+echo "============================================================"
+echo
+echo "This installer copies OwlCarOS to a drive you choose."
+echo "The selected drive will be completely erased."
+echo "The USB you booted from is detected and excluded."
+echo
+
+# The root partition is the running install medium's second partition.
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null | sed -n '1p')
+case "$root_source" in
+    /dev/*)
+        source_root=$(readlink -f "$root_source" 2>/dev/null)
+        ;;
+    PARTUUID=*|UUID=*)
+        source_root=$(blkid -t "$root_source" -o device 2>/dev/null | sed -n '1p')
+        ;;
+    *)
+        source_root=""
+        ;;
+esac
+[ -n "$source_root" ] && [ -b "$source_root" ] || fail "Could not identify the running USB root partition."
+
+source_parent=$(lsblk -n -o PKNAME "$source_root" 2>/dev/null | sed -n '1p' | tr -d '[:space:]')
+if [ -n "$source_parent" ]; then
+    source_disk="/dev/$source_parent"
+else
+    source_disk="$source_root"
+fi
+[ -b "$source_disk" ] || fail "Could not identify the USB boot disk."
+
+source_boot=$(lsblk -nrpo NAME,TYPE "$source_disk" 2>/dev/null | awk '$2 == "part" { n++; if (n == 1) { print $1; exit } }')
+[ -n "$source_boot" ] && [ -b "$source_boot" ] || fail "Could not identify the USB EFI partition."
+
+source_boot_sectors=$(blockdev --getsz "$source_boot" 2>/dev/null)
+source_root_bytes=$(blockdev --getsize64 "$source_root" 2>/dev/null)
+[ -n "$source_boot_sectors" ] && [ -n "$source_root_bytes" ] || fail "Could not read the USB partition sizes."
+
+# Keep the source stable while it is copied.
+root_options=$(findmnt -n -o OPTIONS / 2>/dev/null | sed -n '1p')
+case ",$root_options," in
+    *,ro,*) ;;
+    *) mount -o remount,ro / || fail "Could not make the USB root filesystem read-only." ;;
+esac
+
+mount -o ro "$source_boot" "$SOURCE_MNT" || fail "Could not mount the USB EFI partition."
+[ -f "$SOURCE_MNT/EFI/BOOT/BOOTX64.EFI" ] || fail "The USB EFI boot files are missing."
+[ -f "$SOURCE_MNT/EFI/BOOT/grub.cfg" ] || fail "The USB GRUB configuration is missing."
+
+: > "$DISK_LIST"
+disk_count=0
+while read -r disk size type; do
+    [ "$type" = "disk" ] || continue
+    [ "$disk" != "$source_disk" ] || continue
+    [ -b "$disk" ] || continue
+    model=$(lsblk -dn -o MODEL "$disk" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    serial=$(lsblk -dn -o SERIAL "$disk" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    size_gib=$(awk -v bytes="$size" 'BEGIN { printf "%.1f GiB", bytes / 1073741824 }')
+    disk_count=$((disk_count + 1))
+    printf '%s\n' "$disk" >> "$DISK_LIST"
+    printf '  %d) %-18s %8s  %s' "$disk_count" "$disk" "$size_gib" "$model"
+    [ -z "$serial" ] || printf '  (serial %s)' "$serial"
+    printf '\n'
+done <<EOF
+$(lsblk -dnp -o NAME,SIZE,TYPE 2>/dev/null)
+EOF
+
+[ "$disk_count" -gt 0 ] || fail "No eligible target drives were found."
+echo
+echo "Choose the drive to erase and install to, or enter 0 to cancel:"
+IFS= read -r choice
+case "$choice" in
+    ''|*[!0-9]*) fail "Please enter one of the displayed drive numbers." ;;
+    0) console_shell ;;
+esac
+target_disk=$(awk -v n="$choice" 'NR == n { print $1; exit }' "$DISK_LIST")
+[ -n "$target_disk" ] || fail "That drive number is not in the list."
+[ "$target_disk" != "$source_disk" ] || fail "The installer USB cannot be used as the target."
+[ "$(blockdev --getro "$target_disk" 2>/dev/null)" = "0" ] || fail "The selected drive is read-only."
+if lsblk -nrpo MOUNTPOINTS "$target_disk" 2>/dev/null | grep -q '[^[:space:]]'; then
+    fail "The selected drive has mounted partitions. Unmount them before retrying."
+fi
+
+target_size=$(blockdev --getsize64 "$target_disk" 2>/dev/null)
+required_size=$((source_root_bytes + source_boot_sectors * 512 + 1073741824))
+[ "$target_size" -ge "$required_size" ] || fail "The selected drive is too small for OwlCarOS."
+
+target_model=$(lsblk -dn -o MODEL "$target_disk" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+target_serial=$(lsblk -dn -o SERIAL "$target_disk" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+target_gib=$(awk -v bytes="$target_size" 'BEGIN { printf "%.1f GiB", bytes / 1073741824 }')
+echo
+echo "Selected target:"
+printf '  Drive:  %s\n  Model:  %s\n  Size:   %s\n' "$target_disk" "$target_model" "$target_gib"
+[ -z "$target_serial" ] || printf '  Serial: %s\n' "$target_serial"
+echo
+echo "ALL DATA AND PARTITIONS ON THIS DRIVE WILL BE ERASED."
+printf 'To continue, type exactly: ERASE %s\n> ' "$target_disk"
+IFS= read -r confirmation
+[ "$confirmation" = "ERASE $target_disk" ] || console_shell
+
+echo
+echo "Writing a new GPT partition table..."
+sfdisk --wipe always --wipe-partitions always "$target_disk" <<EOF
+label: gpt
+unit: sectors
+start=2048, size=$source_boot_sectors, type=U
+type=L
+EOF
+[ "$?" -eq 0 ] || fail "Could not create target partitions."
+sync
+
+target_boot=""
+target_root=""
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+    target_boot=$(lsblk -nrpo NAME,TYPE "$target_disk" 2>/dev/null | awk '$2 == "part" { n++; if (n == 1) { print $1; exit } }')
+    target_root=$(lsblk -nrpo NAME,TYPE "$target_disk" 2>/dev/null | awk '$2 == "part" { n++; if (n == 2) { print $1; exit } }')
+    [ -n "$target_boot" ] && [ -n "$target_root" ] && break
+    attempt=$((attempt + 1))
+    sleep 1
+done
+[ -b "$target_boot" ] && [ -b "$target_root" ] || fail "The new target partitions did not appear."
+[ "$(blockdev --getsize64 "$target_boot" 2>/dev/null)" -eq "$((source_boot_sectors * 512))" ] || fail "The target EFI partition has an unexpected size."
+[ "$(blockdev --getsize64 "$target_root" 2>/dev/null)" -ge "$source_root_bytes" ] || fail "The target root partition is too small."
+
+echo "Copying the EFI boot partition..."
+dd if="$source_boot" of="$target_boot" bs=4M conv=fsync || fail "Could not copy the EFI boot partition."
+
+echo "Copying OwlCarOS to the target root partition..."
+dd if="$source_root" of="$target_root" bs=4M conv=fsync || fail "Could not copy the OwlCarOS root partition."
+
+echo "Expanding the root filesystem to use the target drive..."
+resize2fs "$target_root" || fail "Could not expand the root filesystem."
+
+target_partuuid=$(blkid -s PARTUUID -o value "$target_root" 2>/dev/null | sed -n '1p')
+[ -n "$target_partuuid" ] || fail "Could not read the new root partition identifier."
+mount "$target_boot" "$TARGET_MNT" || fail "Could not mount the new EFI partition."
+grub_cfg="$TARGET_MNT/EFI/BOOT/grub.cfg"
+[ -f "$grub_cfg" ] || fail "The copied GRUB configuration is missing."
+sed -i "s/root=PARTUUID=[^ ]*/root=PARTUUID=$target_partuuid/g" "$grub_cfg" || fail "Could not update GRUB with the new root partition."
+grep -q "root=PARTUUID=$target_partuuid" "$grub_cfg" || fail "The GRUB root partition did not update."
+
+sync
+cleanup
+echo
+echo "============================================================"
+echo "          OWLCAROS INSTALLATION COMPLETE"
+echo "============================================================"
+printf 'Installed to %s (%s, %s).\n' "$target_disk" "$target_model" "$target_gib"
+echo "Power off, remove the USB, and boot from the installed drive."
+echo
+exec /bin/sh -i </dev/console >/dev/console 2>&1
