@@ -4,7 +4,7 @@ A lightweight Linux car infotainment system for x86_64 hardware, built with Buil
 
 ## Current project status
 
-**Early development.** The Buildroot image builds and has booted in QEMU. The SDL2/KMSDRM image was flashed to the 64 GB SanDisk and read-back verified. Startup, keyboard input, display compatibility and graphics performance still need testing on target hardware; the current image uses Mesa softpipe without hardware acceleration. Bluetooth AVRCP, USB auto-mounting and the installer also need target testing.
+**Early development.** The SDL2/KMSDRM image boots in WSL QEMU at 1280x800 and detects input devices. The corrected image was flashed to the 64 GB SanDisk and read-back verified. Startup and display compatibility on target hardware, plus graphics performance, still need testing; the image currently uses Mesa softpipe without hardware acceleration. Bluetooth AVRCP, USB auto-mounting and the installer also need target testing.
 
 The system currently includes:
 
