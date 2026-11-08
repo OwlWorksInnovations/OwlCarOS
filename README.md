@@ -4,7 +4,7 @@ A lightweight Linux car infotainment system for x86_64 hardware, built with Buil
 
 ## Current project status
 
-**Early development.** The Buildroot image builds and has booted in QEMU. The current image includes Bluetooth AVRCP metadata and controls plus USB media auto-mounting. These new features have been built but still need runtime testing with a paired phone and removable drives. The installer has not yet been validated on a real installation disk.
+**Early development.** The Buildroot image builds and has booted in QEMU. The latest image, including the System menu and live monitor, was flashed to the 64 GB SanDisk USB and read-back verified. Bluetooth AVRCP, USB auto-mounting and the installer still need runtime testing on the target hardware.
 
 The system currently includes:
 
@@ -12,6 +12,7 @@ The system currently includes:
 - UEFI boot through GRUB, with an automated disk installer
 - Wi-Fi drivers and wpa_supplicant
 - BlueZ Bluetooth pairing and A2DP audio playback through bluealsa
+- System menu with confirmed reboot/shutdown actions and a live CPU, memory, uptime, load and process monitor
 - AVRCP track title and artist display, with play/pause/previous/next controls when the phone exposes a media player
 - Automatic read-only mounting of USB FAT, ext, exFAT and NTFS3 partitions under `/run/media`
 - A native framebuffer interface with keyboard navigation
