@@ -24,7 +24,25 @@ Current features:
 - Bluetooth audio support (BlueZ + bluealsa A2DP sink)
 - ALSA audio utilities (aplay/amixer)
 - Framebuffer/DRM console and display support
-- Login prompt on both the local display and serial console
+- Native framebuffer UI shell (`owlcaros-ui`) with keyboard navigation
+- Boots straight into the dashboard; debug console on `tty2` and serial
+
+## UI controls
+
+`owlcaros-ui` draws directly to `/dev/fb0` (no X11/Wayland) and reads
+`evdev` input, so any keyboard works.
+
+- Arrow keys: move between the four tiles
+- Enter: select the highlighted tile
+- Volume up/down and mute keys: adjust the status bar
+
+The UI runs on `tty1`. Press `Ctrl+Alt+F2` for a debug shell (or use the
+serial console). Runtime information is written to
+`/var/log/owlcaros-ui.log`; restart the UI with:
+
+```sh
+/etc/init.d/S99owlcaros-ui restart
+```
 
 ## Planned features - feel free to make a pull request or issue if you want to add/suggest a feature/support
 
@@ -32,8 +50,8 @@ Current features:
 - ALSA audio output
 - Wi-Fi hotspot connectivity
 - Online maps
-- Native C-based infotainment interface
-- 1990s / early-2000s automotive-inspired design
+- Full infotainment applications inside the native UI shell
+- 1990s / early-2000s automotive-inspired design and themes
 
 ## Repository structure
 
@@ -46,6 +64,14 @@ OwlCarOS/
 ├── .gitignore
 ├── configs/
 │   └── owlcaros_x86_64_defconfig
+├── package/
+│   └── owlcaros-ui/
+│       ├── Config.in
+│       ├── owlcaros-ui.mk
+│       └── src/
+│           ├── main.c
+│           ├── Makefile
+│           └── LICENSE
 └── board/
     └── owlcaros/
         ├── post-build.sh
@@ -59,7 +85,8 @@ OwlCarOS/
         │   └── etc/
         │       ├── inittab
         │       └── init.d/
-        │           └── S45bluealsa
+        │           ├── S45bluealsa
+        │           └── S99owlcaros-ui
         └── staging/
             └── EFI/BOOT/
                 └── grub.cfg

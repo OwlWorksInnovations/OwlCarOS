@@ -28,10 +28,11 @@ null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
 # now run any rc scripts
 ::sysinit:/etc/init.d/rcS
 
-# Put a getty on the video console (/dev/console -> tty0)
-console::respawn:/sbin/getty -L  console 0 vt100 # GENERIC_SERIAL
+# tty1 is owned by owlcaros-ui. Keep a text console on tty2 for debugging
+# (switch to it with Ctrl+Alt+F2).
+tty2::respawn:/sbin/getty -L  tty2 0 vt100
 
-# Also keep a getty on the serial port for debugging
+# Serial console for debugging
 ttyS0::respawn:/sbin/getty -L  ttyS0 115200 vt100
 
 # Stuff to do for the 3-finger salute

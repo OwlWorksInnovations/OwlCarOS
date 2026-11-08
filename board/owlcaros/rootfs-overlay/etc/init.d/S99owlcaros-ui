@@ -1,0 +1,82 @@
+#!/bin/sh
+
+DAEMON="owlcaros-ui"
+PIDFILE="/var/run/$DAEMON.pid"
+DAEMON_PATH="/usr/bin/$DAEMON"
+LOG="/var/log/$DAEMON.log"
+
+running() {
+    [ -s "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE")
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    printf 'Starting %s: ' "$DAEMON"
+
+    if [ ! -x "$DAEMON_PATH" ]; then
+        echo "MISSING"
+        return 1
+    fi
+
+    if running; then
+        echo "ALREADY RUNNING"
+        return 0
+    fi
+
+    # BusyBox start-stop-daemon --background redirects stdio to /dev/null,
+    # which would swallow the log. Start it from the shell instead so
+    # stdout/stderr stay connected to the log file.
+    "$DAEMON_PATH" >>"$LOG" 2>&1 &
+    pid=$!
+    echo "$pid" >"$PIDFILE"
+
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "OK"
+        return 0
+    fi
+
+    echo "FAIL"
+    rm -f "$PIDFILE"
+    return 1
+}
+
+stop() {
+    printf 'Stopping %s: ' "$DAEMON"
+
+    if ! running; then
+        echo "NOT RUNNING"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+
+    pid=$(cat "$PIDFILE")
+    kill "$pid" 2>/dev/null
+
+    i=0
+    while [ "$i" -lt 5 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+    fi
+
+    echo "OK"
+    rm -f "$PIDFILE"
+    return 0
+}
+
+case "$1" in
+    start|stop|restart)
+        "$1"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

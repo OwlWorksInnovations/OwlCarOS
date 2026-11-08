@@ -1,0 +1,8 @@
+config BR2_PACKAGE_OWLCAROS_UI
+	bool "owlcaros-ui"
+	help
+	  Native framebuffer dashboard for OwlCarOS.
+
+	  Runs directly on /dev/fb0 with evdev input and provides the
+	  early-2000s style infotainment interface. No X11 or Wayland
+	  required.
