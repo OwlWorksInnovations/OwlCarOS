@@ -66,6 +66,16 @@ A `bt-agent` pairing agent (bluez-tools) accepts phones with "Just Works"
 pairing, so no PIN or on-screen confirmation is needed. If a phone tried
 to pair with an older build, forget the old entry on the phone first.
 
+If a phone pairs but drops the connection or never offers media audio,
+check that `bluetoothctl show` lists `Audio Sink`. BlueZ only links its
+A2DP/AVRCP plugins at build time, and Buildroot does not regenerate the
+plugin list when `BR2_PACKAGE_BLUEZ5_UTILS_PLUGINS_AUDIO` is toggled on an
+existing build. Rebuild BlueZ from scratch after changing its options:
+
+```sh
+make bluez5_utils-dirclean bluez-alsa-dirclean all
+```
+
 ## Audio
 
 The Intel HD Audio driver and its generic, Realtek, Cirrus and HDMI

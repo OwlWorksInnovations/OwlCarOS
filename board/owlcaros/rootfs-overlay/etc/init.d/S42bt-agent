@@ -22,7 +22,7 @@ start() {
     # org.bluez on the system bus before registering the agent.
     (
         i=0
-        while [ "$i" -lt 20 ]; do
+        while [ "$i" -lt 40 ]; do
             if pidof bluetoothd >/dev/null 2>&1 \
                 && bt-adapter -l >/dev/null 2>&1; then
                 break
@@ -30,6 +30,10 @@ start() {
             sleep 0.5
             i=$((i + 1))
         done
+        # Let phones find the car without a shell. Done here, once the
+        # adapter exists, so a slow firmware load can't skip it.
+        printf 'power on\ndiscoverable on\npairable on\nquit\n' \
+            | bluetoothctl >>/var/log/bluetooth-setup.log 2>&1
         exec "$DAEMON_PATH" --capability=NoInputNoOutput
     ) >>"$LOG" 2>&1 &
     echo "$!" >"$PIDFILE"
