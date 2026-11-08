@@ -2,8 +2,8 @@
 
 A custom, lightweight Linux-based car infotainment operating system.
 
-OwlCarOS is being developed for an older x86_64 laptop, with the goal of
-providing a simple, efficient and retro-inspired car infotainment interface.
+OwlCarOS is being developed for an celeron x86_64 laptop, with the goal of
+providing a simple, efficient and retro-inspired car infotainment interface. _possible theme support_
 
 ## Current status
 
