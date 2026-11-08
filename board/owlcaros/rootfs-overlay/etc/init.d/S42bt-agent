@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# Pairing agent. Without one, BlueZ rejects pairing requests and phones
+# report "couldn't pair". bt-agent registers as the default agent with
+# NoInputNoOutput, so phones pair with "Just Works" and every connection
+# and service request is accepted without a prompt.
+
+DAEMON="bt-agent"
+PIDFILE="/var/run/$DAEMON.pid"
+DAEMON_PATH="/usr/bin/$DAEMON"
+LOG="/var/log/$DAEMON.log"
+
+start() {
+    printf 'Starting %s: ' "$DAEMON"
+
+    if [ ! -x "$DAEMON_PATH" ]; then
+        echo "MISSING"
+        return 1
+    fi
+
+    # bluetoothd (S40) starts in the background; wait for it to own
+    # org.bluez on the system bus before registering the agent.
+    (
+        i=0
+        while [ "$i" -lt 20 ]; do
+            if pidof bluetoothd >/dev/null 2>&1 \
+                && bt-adapter -l >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+            i=$((i + 1))
+        done
+        exec "$DAEMON_PATH" --capability=NoInputNoOutput
+    ) >>"$LOG" 2>&1 &
+    echo "$!" >"$PIDFILE"
+    echo "OK"
+    return 0
+}
+
+stop() {
+    printf 'Stopping %s: ' "$DAEMON"
+    if [ -s "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    killall "$DAEMON" 2>/dev/null
+    echo "OK"
+    return 0
+}
+
+case "$1" in
+    start|stop)
+        "$1"
+        ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

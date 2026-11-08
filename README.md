@@ -59,7 +59,12 @@ track.
 
 When a local track starts, the UI pauses the Bluetooth A2DP player so
 both never fight over the ALSA device, then restarts it when playback
-ends. Phones can connect to the car while it is discoverable.
+ends.
+
+The car shows up as **OwlCarOS** and is always discoverable and pairable.
+A `bt-agent` pairing agent (bluez-tools) accepts phones with "Just Works"
+pairing, so no PIN or on-screen confirmation is needed. If a phone tried
+to pair with an older build, forget the old entry on the phone first.
 
 ## Audio
 
@@ -137,9 +142,11 @@ OwlCarOS/
         │   └── display.config
         ├── rootfs-overlay/
         │   └── etc/
+        │       ├── bluetooth/main.conf
         │       ├── inittab
         │       └── init.d/
-        │           ├── S45bluealsa
+        │           ├── S42bt-agent
+│           ├── S45bluealsa
         │           ├── S46bluealsa-aplay
         │           └── S99owlcaros-ui
         └── staging/
