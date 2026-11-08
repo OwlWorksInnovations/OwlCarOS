@@ -1176,14 +1176,12 @@ static void draw_top_bar(struct fb *fb, int w, int h, uint32_t panel,
     int scale = iclamp(w / 420, 2, 3);
     int y = (top_h - 7 * scale) / 2;
     int margin = imax(w / 64, 12);
-    const char *left = "MEMORY";
     const char *center = "OWLCAROS";
     const char *right = "SYSTEM";
 
     fill_rect(fb, 0, 0, w, top_h, panel);
     fill_rect(fb, 0, top_h - 2, w, 2, red);
 
-    draw_text(fb, margin, y, left, scale, red);
     draw_text_centered(fb, 0, y, w, center, scale, red_bright);
     draw_text(fb, w - margin - text_width(right, scale), y, right, scale, red);
 }
@@ -1365,11 +1363,11 @@ static void draw_home(struct ui *ui)
     int list_y;
 
     static const char *const titles[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SYSTEM"
+        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
     };
     static const char *const details[4] = {
         "BLUETOOTH AND LOCAL AUDIO", "MAPS AND ROUTES",
-        "HANDS-FREE", "POWER AND STATUS"
+        "HANDS-FREE", "SYSTEM"
     };
 
     if (curve > 36)
@@ -1958,7 +1956,7 @@ static int handle_global_key(struct ui *ui, int code)
 static void handle_home_key(struct ui *ui, int code, int *dirty)
 {
     static const char *const names[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SYSTEM"
+        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
     };
 
     switch (code) {
