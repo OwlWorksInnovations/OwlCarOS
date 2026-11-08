@@ -22,6 +22,7 @@ Current features:
 - QEMU UEFI boot tested
 - Broad Wi-Fi driver support (incl. wpa_supplicant and regulatory database)
 - Bluetooth audio support (BlueZ + bluealsa A2DP sink)
+- Automatic driver loading via BusyBox mdev (Wi-Fi/Bluetooth modules, USB hotplug)
 - A2DP playback through `bluealsa-aplay`, with discoverable/pairable mode
 - ALSA audio utilities (aplay/amixer) and MP3 playback via mpg123
 - Framebuffer/DRM console and display support
@@ -63,9 +64,8 @@ ends. Phones can connect to the car while it is discoverable.
 ## Audio
 
 The Intel HD Audio driver and its generic, Realtek, Cirrus and HDMI
-codecs are built into the kernel rather than as modules. The image has no
-modalias autoloading, so modular codecs would never bind and no sound card
-would appear at boot.
+codecs are built into the kernel, so the sound card is ready as soon as
+the kernel boots.
 
 A fresh ALSA state can leave the mixer muted or at 0%. On startup the UI
 picks the best playback control (`Master`, then `PCM`, `Speaker`, ...)
