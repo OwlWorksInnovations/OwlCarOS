@@ -1,0 +1,56 @@
+#!/bin/sh
+
+DAEMON="bluealsa-aplay"
+PIDFILE="/var/run/$DAEMON.pid"
+DAEMON_PATH="/usr/bin/$DAEMON"
+
+start() {
+    printf 'Starting %s: ' "$DAEMON"
+
+    if [ ! -x "$DAEMON_PATH" ]; then
+        echo "MISSING"
+        return 1
+    fi
+
+    # Play A2DP audio from any paired phone to the default ALSA PCM.
+    start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$PIDFILE" --exec "$DAEMON_PATH" \
+        -- --profile-a2dp 00:00:00:00:00:00
+
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+    fi
+    return "$status"
+}
+
+stop() {
+    printf 'Stopping %s: ' "$DAEMON"
+
+    start-stop-daemon --stop --pidfile "$PIDFILE" --exec "$DAEMON_PATH"
+
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "OK"
+        rm -f "$PIDFILE"
+    else
+        echo "FAIL"
+    fi
+    return "$status"
+}
+
+case "$1" in
+    start|stop)
+        "$1"
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

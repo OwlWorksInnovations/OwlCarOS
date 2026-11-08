@@ -4,28 +4,50 @@
  * Draws directly to /dev/fb0 and reads keyboard events from evdev.
  * No X11, Wayland, SDL or other graphics stack required.
  *
+ * The visual language is inspired by the red dot-matrix instrument
+ * cluster of the 2004 Audi TT (8N): black background, red LEDs and
+ * warm white markings.
+ *
  * SPDX-License-Identifier: MIT
  */
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/kd.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_INPUTS 16
+#define MAX_INPUTS      16
+#define MAX_TRACKS      64
+#define TRACK_PATH      512
+#define TRACK_NAME      96
+#define BT_A2DP_PIDFILE "/var/run/bluealsa-aplay.pid"
+#define BT_A2DP_SERVICE "/etc/init.d/S46bluealsa-aplay"
+
+#define SCREEN_HOME   0
+#define SCREEN_MEDIA  1
+
+#define SRC_NONE      0
+#define SRC_LOCAL     1
+#define SRC_BT        2
 
 /*
  * 5x7 bitmap font. Each glyph is 7 rows, one byte per row.
@@ -35,6 +57,13 @@
 static const uint8_t font5x7[96][7] = {
     [' ' - 32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     ['!' - 32] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04},
+    ['%' - 32] = {0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13},
+    ['\'' - 32] = {0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00},
+    ['(' - 32] = {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02},
+    [')' - 32] = {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08},
+    ['+' - 32] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00},
+    [',' - 32] = {0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08},
+    ['-' - 32] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00},
     ['.' - 32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C},
     ['/' - 32] = {0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00},
     ['0' - 32] = {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},
@@ -49,6 +78,7 @@ static const uint8_t font5x7[96][7] = {
     ['9' - 32] = {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C},
     [':' - 32] = {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00},
     ['<' - 32] = {0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01},
+    ['=' - 32] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00},
     ['>' - 32] = {0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10},
     ['?' - 32] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04},
     ['A' - 32] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
@@ -81,6 +111,35 @@ static const uint8_t font5x7[96][7] = {
     ['|' - 32] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
 };
 
+/*
+ * 16x16 dot-matrix pictograms, one bit per LED.
+ *
+ * Media is a compact cassette (two reels and a label strip). Navigation
+ * is a heading arrow inside a bezel, like a cluster gauge. Phone is a
+ * handset with a screen and keypad, settings is a cog. Everything is
+ * drawn from lit dots so the tiles match the red LED matrix of the TT
+ * cluster.
+ */
+static const uint16_t icon_media[16] = {
+    0x0000, 0x0000, 0x0000, 0x7ffe, 0x4002, 0x5e7a, 0x565a, 0x5e7a,
+    0x4002, 0x4ff2, 0x4ff2, 0x4002, 0x7ffe, 0x0000, 0x0000, 0x0000,
+};
+
+static const uint16_t icon_navigation[16] = {
+    0x0000, 0x0000, 0x07e0, 0x1838, 0x301c, 0x6186, 0x63c6, 0xc7e3,
+    0xcff3, 0x67e6, 0x63c6, 0x318c, 0x1818, 0x07e0, 0x0000, 0x0000,
+};
+
+static const uint16_t icon_phone[16] = {
+    0x0000, 0x0000, 0x0000, 0x0ff8, 0x0808, 0x0be8, 0x0be8, 0x0808,
+    0x0aa8, 0x0808, 0x0aa8, 0x0808, 0x0ff8, 0x0000, 0x0000, 0x0000,
+};
+
+static const uint16_t icon_settings[16] = {
+    0x0000, 0x0000, 0x0000, 0x0c30, 0x0c30, 0x3ffc, 0x7ffe, 0x6c36,
+    0x6c36, 0x7ffe, 0x3ffc, 0x0c30, 0x0c30, 0x0000, 0x0000, 0x0000,
+};
+
 struct fb {
     int fd;
     uint8_t *mem;
@@ -94,15 +153,35 @@ struct fb {
     uint8_t *back;
 };
 
+struct track {
+    char path[TRACK_PATH];
+    char name[TRACK_NAME];
+    double duration;
+};
+
+struct media {
+    struct track tracks[MAX_TRACKS];
+    int track_count;
+    int selected;        /* 0 = Bluetooth entry, 1..n = local tracks */
+    int source;          /* SRC_NONE / SRC_LOCAL / SRC_BT */
+    int local_index;     /* 0-based index when source == SRC_LOCAL */
+    int paused;
+    pid_t pid;
+    double started;      /* monotonic time the current play segment began */
+    double elapsed;      /* accumulated playback time before that segment */
+    int bt_was_stopped;  /* we stopped the A2DP player for local audio */
+    char mixer[48];
+    int volume;
+    int muted;
+};
+
 struct ui {
     struct fb fb;
     int ttyfd;
+    int screen;
     int selected;
-    int volume;
-    int muted;
-    int bt_on;
-    int wifi_on;
     char status[64];
+    struct media media;
 };
 
 static volatile sig_atomic_t g_running = 1;
@@ -125,6 +204,14 @@ static int iclamp(int v, int lo, int hi)
     if (v > hi)
         return hi;
     return v;
+}
+
+static double mono_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 static uint32_t color_pack(const struct fb *fb, uint32_t rgb)
@@ -219,6 +306,49 @@ static void draw_text_centered(struct fb *fb, int x, int y, int w,
                                const char *text, int scale, uint32_t color)
 {
     draw_text(fb, x + (w - text_width(text, scale)) / 2, y, text, scale, color);
+}
+
+static void draw_text_ellipsis(struct fb *fb, int x, int y, int maxw,
+                               const char *text, int scale, uint32_t color)
+{
+    int maxchars = maxw / (6 * scale);
+    char buf[TRACK_NAME];
+
+    if (maxchars < 4) {
+        draw_text(fb, x, y, "", scale, color);
+        return;
+    }
+
+    snprintf(buf, sizeof(buf), "%s", text);
+    if ((int)strlen(buf) > maxchars) {
+        buf[maxchars - 2] = '\0';
+        strncat(buf, "..", sizeof(buf) - strlen(buf) - 1);
+    }
+    draw_text(fb, x, y, buf, scale, color);
+}
+
+/*
+ * Draw a pictogram as a grid of glowing LED dots. The full cell is
+ * painted with the dim glow colour and a smaller inset cell with the
+ * bright colour, leaving a one-pixel gap that reads as a dot matrix.
+ */
+static void draw_icon(struct fb *fb, int x, int y, int dot,
+                      const uint16_t *rows, uint32_t on, uint32_t glow)
+{
+    for (int r = 0; r < 16; r++) {
+        uint16_t bits = rows[r];
+
+        for (int c = 0; c < 16; c++) {
+            if (!(bits & (1u << (15 - c))))
+                continue;
+            fill_rect(fb, x + c * dot, y + r * dot, dot, dot, glow);
+            if (dot > 2)
+                fill_rect(fb, x + c * dot + 1, y + r * dot + 1,
+                          dot - 2, dot - 2, on);
+            else
+                fill_rect(fb, x + c * dot, y + r * dot, dot, dot, on);
+        }
+    }
 }
 
 static void fb_present(struct fb *fb)
@@ -343,9 +473,984 @@ static int input_open(int *fds, int max)
     return count;
 }
 
-static void handle_key(struct ui *ui, int code, int *dirty)
+static void run_cmd(const char *fmt, ...)
 {
-    static const char *const names[] = {
+    char cmd[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+
+    int rc = system(cmd);
+
+    (void)rc;
+}
+
+static int pidfile_alive(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    long pid = 0;
+    int ok;
+
+    if (f == NULL)
+        return 0;
+    ok = fscanf(f, "%ld", &pid) == 1;
+    fclose(f);
+    return ok && pid > 0 && kill((pid_t)pid, 0) == 0;
+}
+
+static int bt_aplay_available(void)
+{
+    return access(BT_A2DP_SERVICE, X_OK) == 0;
+}
+
+static int bt_aplay_running(void)
+{
+    return pidfile_alive(BT_A2DP_PIDFILE);
+}
+
+static void bt_aplay(int start)
+{
+    run_cmd("%s %s >/dev/null 2>&1", BT_A2DP_SERVICE, start ? "start" : "stop");
+}
+
+static int bt_adapter_present(void)
+{
+    return access("/sys/class/bluetooth/hci0", F_OK) == 0;
+}
+
+static int alsa_playback_running(void)
+{
+    char path[96];
+
+    for (int card = 0; card < 4; card++) {
+        for (int pcm = 0; pcm < 4; pcm++) {
+            char line[128];
+            int running = 0;
+            FILE *f;
+
+            snprintf(path, sizeof(path),
+                     "/proc/asound/card%d/pcm%dp/sub0/status", card, pcm);
+            f = fopen(path, "r");
+            if (f == NULL)
+                continue;
+            while (fgets(line, sizeof(line), f)) {
+                if (strstr(line, "state: RUNNING") != NULL)
+                    running = 1;
+            }
+            fclose(f);
+            if (running)
+                return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void audio_refresh(struct ui *ui)
+{
+    struct media *m = &ui->media;
+    char cmd[192];
+    char line[256];
+    int vol = -1;
+    int on = 0;
+    int off = 0;
+    FILE *p;
+
+    snprintf(cmd, sizeof(cmd), "amixer sget '%s' 2>/dev/null", m->mixer);
+    p = popen(cmd, "r");
+    if (p == NULL)
+        return;
+
+    while (fgets(line, sizeof(line), p)) {
+        char *pct = strchr(line, '[');
+
+        while (pct != NULL) {
+            if (pct[1] >= '0' && pct[1] <= '9') {
+                char *end;
+                long v = strtol(pct + 1, &end, 10);
+
+                if (*end == '%') {
+                    vol = (int)v;
+                    break;
+                }
+            }
+            pct = strchr(pct + 1, '[');
+        }
+        if (strstr(line, "[off]") != NULL)
+            off = 1;
+        if (strstr(line, "[on]") != NULL)
+            on = 1;
+    }
+    pclose(p);
+
+    if (vol >= 0)
+        m->volume = iclamp(vol, 0, 100);
+    if (on)
+        m->muted = 0;
+    else if (off)
+        m->muted = 1;
+}
+
+static void audio_apply(struct ui *ui);
+
+static int mixer_rank(const char *name)
+{
+    static const char *const preferred[] = {
+        "Master", "PCM", "Speaker", "Headphone", "Front", NULL
+    };
+
+    for (int i = 0; preferred[i] != NULL; i++) {
+        if (strcasecmp(name, preferred[i]) == 0)
+            return i;
+    }
+    return 100;
+}
+
+static void audio_init(struct ui *ui)
+{
+    struct media *m = &ui->media;
+    char line[256];
+    char fallback[48] = "";
+    int best = 100;
+    FILE *p;
+
+    m->volume = 50;
+    m->muted = 0;
+    snprintf(m->mixer, sizeof(m->mixer), "Master");
+
+    p = popen("amixer scontrols 2>/dev/null", "r");
+    if (p != NULL) {
+        while (fgets(line, sizeof(line), p)) {
+            char *a = strchr(line, '\'');
+            char *b = a ? strchr(a + 1, '\'') : NULL;
+            char name[48];
+            size_t n;
+            int rank;
+
+            if (a == NULL || b == NULL)
+                continue;
+            n = (size_t)(b - a - 1);
+            if (n == 0 || n >= sizeof(name))
+                continue;
+            memcpy(name, a + 1, n);
+            name[n] = '\0';
+
+            rank = mixer_rank(name);
+            if (fallback[0] == '\0')
+                snprintf(fallback, sizeof(fallback), "%s", name);
+            if (rank < best) {
+                best = rank;
+                snprintf(m->mixer, sizeof(m->mixer), "%s", name);
+            }
+        }
+        pclose(p);
+    }
+
+    if (best == 100 && fallback[0] != '\0')
+        snprintf(m->mixer, sizeof(m->mixer), "%s", fallback);
+
+    audio_refresh(ui);
+
+    /*
+     * A fresh ALSA state can leave the mixer muted or at 0%, which makes
+     * a working player look broken. Start every boot at a comfortable
+     * level and unmuted; the volume keys take over from there.
+     */
+    if (m->volume < 20) {
+        m->volume = 60;
+        m->muted = 0;
+        audio_apply(ui);
+    }
+}
+
+static void audio_apply(struct ui *ui)
+{
+    struct media *m = &ui->media;
+
+    run_cmd("amixer -q sset '%s' %d%% %s >/dev/null 2>&1",
+            m->mixer, m->volume, m->muted ? "mute" : "unmute");
+}
+
+static void audio_adjust(struct ui *ui, int delta)
+{
+    struct media *m = &ui->media;
+
+    m->volume = iclamp(m->volume + delta, 0, 100);
+    if (delta != 0)
+        m->muted = 0;
+    audio_apply(ui);
+}
+
+static uint32_t rd32le(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+           | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static double wav_duration(const char *path)
+{
+    unsigned char hdr[12];
+    uint32_t byte_rate = 0;
+    FILE *f = fopen(path, "rb");
+
+    if (f == NULL)
+        return 0;
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)
+        || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fclose(f);
+        return 0;
+    }
+
+    for (;;) {
+        unsigned char ch[8];
+        uint32_t size;
+
+        if (fread(ch, 1, sizeof(ch), f) != sizeof(ch))
+            break;
+        size = rd32le(ch + 4);
+
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            unsigned char fmt[16];
+
+            if (fread(fmt, 1, sizeof(fmt), f) != sizeof(fmt))
+                break;
+            byte_rate = rd32le(fmt + 8);
+            if (size > 16)
+                fseek(f, (long)(size - 16 + (size & 1)), SEEK_CUR);
+            else if (size & 1)
+                fseek(f, 1, SEEK_CUR);
+        } else if (memcmp(ch, "data", 4) == 0) {
+            fclose(f);
+            return byte_rate ? (double)size / (double)byte_rate : 0;
+        } else {
+            fseek(f, (long)(size + (size & 1)), SEEK_CUR);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int has_ext(const char *path, const char *ext)
+{
+    size_t n = strlen(path);
+    size_t e = strlen(ext);
+
+    return n >= e && strcasecmp(path + n - e, ext) == 0;
+}
+
+static int is_audio_file(const char *path)
+{
+    return has_ext(path, ".wav") || has_ext(path, ".mp3");
+}
+
+static void add_track(struct media *m, const char *path)
+{
+    const char *base = strrchr(path, '/');
+    struct track *t;
+    size_t len;
+    char *dot;
+
+    if (m->track_count >= MAX_TRACKS)
+        return;
+    for (int i = 0; i < m->track_count; i++) {
+        if (strcmp(m->tracks[i].path, path) == 0)
+            return;
+    }
+
+    base = base ? base + 1 : path;
+    t = &m->tracks[m->track_count];
+    snprintf(t->path, sizeof(t->path), "%s", path);
+
+    len = strlen(base);
+    if (len >= sizeof(t->name))
+        len = sizeof(t->name) - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = base[i];
+
+        if (c == '_' || c == '-')
+            c = ' ';
+        t->name[i] = c;
+    }
+    t->name[len] = '\0';
+
+    dot = strrchr(t->name, '.');
+    if (dot != NULL)
+        *dot = '\0';
+
+    t->duration = has_ext(path, ".wav") ? wav_duration(path) : 0;
+    m->track_count++;
+}
+
+static void scan_dir(struct media *m, const char *dir, int depth)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+
+    if (d == NULL)
+        return;
+
+    while ((e = readdir(d)) != NULL) {
+        char path[TRACK_PATH];
+        struct stat st;
+        int n;
+
+        if (e->d_name[0] == '.')
+            continue;
+        n = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (n < 0 || n >= (int)sizeof(path))
+            continue;
+        if (stat(path, &st) < 0)
+            continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            if (depth > 0)
+                scan_dir(m, path, depth - 1);
+        } else if (S_ISREG(st.st_mode) && is_audio_file(path)) {
+            add_track(m, path);
+        }
+
+        if (m->track_count >= MAX_TRACKS)
+            break;
+    }
+
+    closedir(d);
+}
+
+static int track_cmp(const void *a, const void *b)
+{
+    const struct track *ta = a;
+    const struct track *tb = b;
+
+    return strcmp(ta->name, tb->name);
+}
+
+static void media_scan(struct ui *ui)
+{
+    static const struct {
+        const char *path;
+        int depth;
+    } dirs[] = {
+        { "/media", 2 },
+        { "/run/media", 2 },
+        { "/mnt", 1 },
+        { "/root/Music", 2 },
+        { "/usr/share/owlcaros/media", 1 },
+    };
+    struct media *m = &ui->media;
+
+    m->track_count = 0;
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        scan_dir(m, dirs[i].path, dirs[i].depth);
+
+    qsort(m->tracks, (size_t)m->track_count, sizeof(m->tracks[0]), track_cmp);
+}
+
+static void local_stop(struct ui *ui)
+{
+    struct media *m = &ui->media;
+
+    if (m->pid > 0) {
+        kill(m->pid, SIGTERM);
+        for (int i = 0; i < 10; i++) {
+            if (waitpid(m->pid, NULL, WNOHANG) == m->pid) {
+                m->pid = -1;
+                break;
+            }
+            usleep(50000);
+        }
+        if (m->pid > 0) {
+            kill(m->pid, SIGKILL);
+            waitpid(m->pid, NULL, 0);
+            m->pid = -1;
+        }
+    }
+
+    if (m->source == SRC_LOCAL)
+        m->source = SRC_NONE;
+    m->paused = 0;
+    m->local_index = -1;
+}
+
+static void bt_resume(struct ui *ui)
+{
+    struct media *m = &ui->media;
+
+    if (m->bt_was_stopped && bt_aplay_available()) {
+        bt_aplay(1);
+        m->bt_was_stopped = 0;
+    }
+}
+
+static void local_start(struct ui *ui, int index)
+{
+    struct media *m = &ui->media;
+    pid_t pid;
+
+    if (index < 0 || index >= m->track_count)
+        return;
+
+    local_stop(ui);
+
+    if (bt_aplay_running() && bt_aplay_available()) {
+        bt_aplay(0);
+        m->bt_was_stopped = 1;
+        usleep(200000);
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        int fd = open("/dev/null", O_RDONLY);
+
+        if (fd >= 0) {
+            dup2(fd, STDIN_FILENO);
+            close(fd);
+        }
+        if (has_ext(m->tracks[index].path, ".mp3"))
+            execlp("mpg123", "mpg123", "-q", "--",
+                   m->tracks[index].path, (char *)NULL);
+        else
+            execlp("aplay", "aplay", "-q", m->tracks[index].path, (char *)NULL);
+        _exit(127);
+    }
+
+    if (pid < 0) {
+        snprintf(ui->status, sizeof(ui->status), "PLAYER ERROR");
+        return;
+    }
+
+    m->pid = pid;
+    m->source = SRC_LOCAL;
+    m->local_index = index;
+    m->paused = 0;
+    m->elapsed = 0;
+    m->started = mono_now();
+    m->selected = index + 1;
+    snprintf(ui->status, sizeof(ui->status), "PLAYING %.40s",
+             m->tracks[index].name);
+}
+
+static double local_elapsed(const struct media *m)
+{
+    if (m->paused)
+        return m->elapsed;
+    return m->elapsed + (mono_now() - m->started);
+}
+
+static void local_toggle(struct ui *ui, int index)
+{
+    struct media *m = &ui->media;
+
+    if (m->source == SRC_LOCAL && m->local_index == index && m->pid > 0) {
+        if (m->paused) {
+            kill(m->pid, SIGCONT);
+            m->paused = 0;
+            m->started = mono_now();
+            snprintf(ui->status, sizeof(ui->status), "PLAYING %.40s",
+                     m->tracks[index].name);
+        } else {
+            m->elapsed = local_elapsed(m);
+            kill(m->pid, SIGSTOP);
+            m->paused = 1;
+            snprintf(ui->status, sizeof(ui->status), "PAUSED");
+        }
+        return;
+    }
+
+    if (m->source != SRC_LOCAL)
+        bt_resume(ui);
+    local_start(ui, index);
+}
+
+static void bt_start(struct ui *ui)
+{
+    struct media *m = &ui->media;
+
+    local_stop(ui);
+    bt_resume(ui);
+    m->source = SRC_BT;
+    m->selected = 0;
+
+    if (!bt_aplay_available()) {
+        snprintf(ui->status, sizeof(ui->status), "BT AUDIO SERVICE MISSING");
+        return;
+    }
+    if (!bt_adapter_present()) {
+        snprintf(ui->status, sizeof(ui->status), "NO BLUETOOTH ADAPTER");
+        return;
+    }
+    if (!bt_aplay_running())
+        bt_aplay(1);
+    snprintf(ui->status, sizeof(ui->status), "BLUETOOTH AUDIO");
+}
+
+static void local_skip(struct ui *ui, int dir)
+{
+    struct media *m = &ui->media;
+    int idx;
+
+    if (m->track_count == 0)
+        return;
+
+    if (m->source == SRC_LOCAL && m->local_index >= 0)
+        idx = m->local_index + dir;
+    else
+        idx = dir > 0 ? 0 : m->track_count - 1;
+
+    if (idx < 0)
+        idx = m->track_count - 1;
+    if (idx >= m->track_count)
+        idx = 0;
+
+    local_start(ui, idx);
+}
+
+static void media_poll(struct ui *ui)
+{
+    struct media *m = &ui->media;
+    int status;
+    pid_t r;
+
+    if (m->pid <= 0)
+        return;
+
+    r = waitpid(m->pid, &status, WNOHANG);
+    if (r != m->pid)
+        return;
+
+    (void)status;
+    m->pid = -1;
+    m->paused = 0;
+
+    if (m->source == SRC_LOCAL) {
+        int next = m->local_index + 1;
+
+        m->source = SRC_NONE;
+        m->local_index = -1;
+        if (next < m->track_count) {
+            local_start(ui, next);
+        } else {
+            bt_resume(ui);
+            snprintf(ui->status, sizeof(ui->status), "END OF PLAYLIST");
+        }
+    }
+}
+
+static void draw_top_bar(struct fb *fb, int w, int h, uint32_t panel,
+                         uint32_t red, uint32_t red_bright, uint32_t orange)
+{
+    int top_h = imax(h / 12, 40);
+    int scale = iclamp(w / 420, 2, 4);
+    char clockbuf[16];
+    time_t now = time(NULL);
+    struct tm tm_now;
+
+    fill_rect(fb, 0, 0, w, top_h, panel);
+    fill_rect(fb, 0, top_h - 2, w, 2, red);
+
+    draw_text(fb, imax(w / 64, 12), (top_h - 7 * scale) / 2, "OWLCAROS",
+              scale, red_bright);
+
+    localtime_r(&now, &tm_now);
+    strftime(clockbuf, sizeof(clockbuf), "%H:%M", &tm_now);
+    draw_text(fb, w - imax(w / 64, 12) - text_width(clockbuf, scale),
+              (top_h - 7 * scale) / 2, clockbuf, scale, orange);
+}
+
+static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
+                            uint32_t panel, uint32_t red, uint32_t red_dim)
+{
+    const struct media *m = &ui->media;
+    int bottom_h = imax(h / 18, 26);
+    int scale = iclamp(w / 1280, 1, 2);
+    char status[192];
+    int bt_on;
+    int sy;
+
+    bt_on = bt_adapter_present();
+
+    snprintf(status, sizeof(status),
+             "BT %s   |   WIFI OFF   |   VOL %s%3d   |   %s",
+             bt_on ? "ON " : "OFF",
+             m->muted ? "MUTE " : "",
+             m->volume,
+             ui->status[0] ? ui->status : "READY");
+
+    fill_rect(fb, 0, h - bottom_h, w, bottom_h, panel);
+    fill_rect(fb, 0, h - bottom_h, w, 2, red);
+
+    sy = h - bottom_h + (bottom_h - 7 * scale) / 2;
+    draw_text(fb, imax(w / 64, 12), sy, status, scale, red_dim);
+}
+
+static void draw_home(struct ui *ui)
+{
+    struct fb *fb = &ui->fb;
+    const int w = (int)fb->xres;
+    const int h = (int)fb->yres;
+    const uint32_t c_bg = color_pack(fb, 0x000000);
+    const uint32_t c_panel = color_pack(fb, 0x120200);
+    const uint32_t c_panel_sel = color_pack(fb, 0x2A0503);
+    const uint32_t c_red = color_pack(fb, 0xD01408);
+    const uint32_t c_red_bright = color_pack(fb, 0xFF3B24);
+    const uint32_t c_red_dim = color_pack(fb, 0x6E150D);
+    const uint32_t c_glow = color_pack(fb, 0x330400);
+    const uint32_t c_glow_sel = color_pack(fb, 0x4A0500);
+    const uint32_t c_text = color_pack(fb, 0xF4E3DC);
+    const uint32_t c_text_dim = color_pack(fb, 0x9A5F57);
+    const uint32_t c_orange = color_pack(fb, 0xFF4D00);
+    const int top_h = imax(h / 12, 40);
+    const int bottom_h = imax(h / 18, 26);
+    const int margin = imax(w / 64, 12);
+    const int gap = imax(w / 128, 8);
+
+    static const uint16_t *const icons[4] = {
+        icon_media, icon_navigation, icon_phone, icon_settings
+    };
+    static const char *const tiles[4] = {
+        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
+    };
+    static const char *const subtitles[4] = {
+        "AUDIO / BLUETOOTH", "MAPS & ROUTES", "HANDS-FREE", "SYSTEM"
+    };
+
+    fill_rect(fb, 0, 0, w, h, c_bg);
+    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright, c_orange);
+
+    int area_y = top_h + margin;
+    int area_h = h - top_h - bottom_h - 2 * margin;
+    int tile_w = (w - 2 * margin - gap) / 2;
+    int tile_h = (area_h - gap) / 2;
+    int label_scale = iclamp(w / 320, 2, 5);
+    int sub_scale = 2;
+
+    for (int i = 0; i < 4; i++) {
+        int tx = margin + (i % 2) * (tile_w + gap);
+        int ty = area_y + (i / 2) * (tile_h + gap);
+        int selected = (i == ui->selected);
+        uint32_t border = selected ? c_red_bright : c_red_dim;
+        uint32_t icon_on = selected ? c_red_bright : c_red;
+        uint32_t icon_glow = selected ? c_glow_sel : c_glow;
+        int dot = iclamp(tile_h / 9, 3, 7);
+        int icon_px = 16 * dot;
+        int lh = 7 * label_scale;
+        int sub_h = 7 * sub_scale;
+        int block_h = icon_px + 18 + lh + 10 + sub_h;
+        int by = ty + (tile_h - block_h) / 2;
+        int ix = tx + (tile_w - icon_px) / 2;
+
+        fill_rect(fb, tx, ty, tile_w, tile_h,
+                  selected ? c_panel_sel : c_panel);
+        fill_rect(fb, tx, ty, tile_w, 2, border);
+        fill_rect(fb, tx, ty + tile_h - 2, tile_w, 2, border);
+        fill_rect(fb, tx, ty, 2, tile_h, border);
+        fill_rect(fb, tx + tile_w - 2, ty, 2, tile_h, border);
+
+        draw_icon(fb, ix, by, dot, icons[i], icon_on, icon_glow);
+
+        draw_text_centered(fb, tx, by + icon_px + 18, tile_w, tiles[i],
+                           label_scale, selected ? c_red_bright : c_text);
+        draw_text_centered(fb, tx, by + icon_px + 18 + lh + 10, tile_w,
+                           subtitles[i], sub_scale,
+                           selected ? c_text_dim : c_red_dim);
+
+        if (selected) {
+            int bar_w = imax(tile_w / 6, 24);
+
+            fill_rect(fb, tx + (tile_w - bar_w) / 2, ty + tile_h - 20,
+                      bar_w, 3, c_orange);
+        }
+    }
+
+    draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
+}
+
+static void fmt_time(char *buf, size_t n, double seconds)
+{
+    int s = (int)seconds;
+
+    if (s < 0)
+        s = 0;
+    snprintf(buf, n, "%d:%02d", s / 60, s % 60);
+}
+
+static void draw_vu(struct fb *fb, int x, int y, int w, int h, int active,
+                    double t, uint32_t low, uint32_t mid, uint32_t high,
+                    uint32_t off)
+{
+    int bars = 24;
+    int gap = imax(w / 240, 2);
+    int bw = (w - (bars - 1) * gap) / bars;
+    int seg_h = 5;
+    int seg_gap = 3;
+    int segs = h / (seg_h + seg_gap);
+
+    if (bw < 2) {
+        bars = 12;
+        gap = 2;
+        bw = (w - (bars - 1) * gap) / bars;
+    }
+    if (bw < 1 || segs < 1)
+        return;
+
+    for (int i = 0; i < bars; i++) {
+        int level;
+        int lit;
+
+        if (active)
+            level = 32 + (int)(((long)(t * 11.0) + i * 17 + i * i * 7) % 62);
+        else
+            level = 5;
+
+        lit = level * segs / 100;
+        if (lit < 1)
+            lit = 1;
+
+        for (int s = 0; s < lit; s++) {
+            int sy = y + h - (s + 1) * (seg_h + seg_gap);
+            uint32_t c;
+
+            if (s * 100 >= segs * 75)
+                c = high;
+            else if (s * 100 >= segs * 45)
+                c = mid;
+            else
+                c = low;
+
+            fill_rect(fb, x + i * (bw + gap), sy, bw, seg_h, c);
+        }
+
+        for (int s = lit; s < segs; s++) {
+            int sy = y + h - (s + 1) * (seg_h + seg_gap);
+
+            fill_rect(fb, x + i * (bw + gap), sy, bw, 1, off);
+        }
+    }
+}
+
+static void draw_media(struct ui *ui)
+{
+    struct fb *fb = &ui->fb;
+    const int w = (int)fb->xres;
+    const int h = (int)fb->yres;
+    const uint32_t c_bg = color_pack(fb, 0x000000);
+    const uint32_t c_panel = color_pack(fb, 0x120200);
+    const uint32_t c_panel_sel = color_pack(fb, 0x2A0503);
+    const uint32_t c_red = color_pack(fb, 0xD01408);
+    const uint32_t c_red_bright = color_pack(fb, 0xFF3B24);
+    const uint32_t c_red_dim = color_pack(fb, 0x6E150D);
+    const uint32_t c_red_faint = color_pack(fb, 0x2A0A06);
+    const uint32_t c_glow = color_pack(fb, 0x330400);
+    const uint32_t c_text = color_pack(fb, 0xF4E3DC);
+    const uint32_t c_text_dim = color_pack(fb, 0x9A5F57);
+    const uint32_t c_orange = color_pack(fb, 0xFF4D00);
+    const int top_h = imax(h / 12, 40);
+    const int bottom_h = imax(h / 18, 26);
+    const int margin = imax(w / 64, 12);
+    const int gap = imax(w / 128, 8);
+    const int pad = imax(w / 48, 18);
+    struct media *m = &ui->media;
+    const struct track *tr = NULL;
+    char timebuf[32];
+    char durbuf[16];
+    char line[128];
+    const char *state = "IDLE";
+    const char *source = "NO SOURCE";
+    const char *title = "NO SOURCE";
+    int active = 0;
+    double elapsed = 0;
+    double duration = 0;
+    int content_y = top_h + margin;
+    int content_h = h - top_h - bottom_h - 2 * margin;
+    int left_w = (w - 2 * margin - gap) * 3 / 5;
+    int right_w = w - 2 * margin - gap - left_w;
+    int lx = margin;
+    int rx = margin + left_w + gap;
+
+    fill_rect(fb, 0, 0, w, h, c_bg);
+    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright, c_orange);
+
+    if (m->source == SRC_LOCAL && m->local_index >= 0
+        && m->local_index < m->track_count) {
+        tr = &m->tracks[m->local_index];
+        title = tr->name;
+        source = "LOCAL";
+        state = m->paused ? "PAUSED" : "PLAYING";
+        elapsed = local_elapsed(m);
+        duration = tr->duration;
+        active = !m->paused;
+    } else if (m->source == SRC_BT) {
+        int streaming = alsa_playback_running();
+
+        title = "BLUETOOTH AUDIO";
+        source = "A2DP";
+        state = streaming ? "STREAMING" : "WAITING FOR PHONE";
+        active = streaming;
+    }
+
+    /* Left: now playing */
+    fill_rect(fb, lx, content_y, left_w, content_h, c_panel);
+    fill_rect(fb, lx, content_y, left_w, 2, c_red_dim);
+    fill_rect(fb, lx, content_y + content_h - 2, left_w, 2, c_red_dim);
+    fill_rect(fb, lx, content_y, 2, content_h, c_red_dim);
+    fill_rect(fb, lx + left_w - 2, content_y, 2, content_h, c_red_dim);
+
+    int x = lx + pad;
+    int iw = left_w - 2 * pad;
+    int y = content_y + pad;
+
+    draw_text(fb, x, y, "NOW PLAYING", 2, c_red_dim);
+    y += 14 + 14;
+
+    draw_icon(fb, x, y, 3, icon_media, c_red, c_glow);
+    draw_text(fb, x + 16 * 3 + 16, y + 2, source, 2, c_orange);
+    draw_text(fb, x + 16 * 3 + 16, y + 2 + 18, state, 2,
+              active ? c_red_bright : c_text_dim);
+    y += 16 * 3 + 18;
+
+    draw_text_ellipsis(fb, x, y, iw, title, 4,
+                       m->source == SRC_NONE ? c_text_dim : c_text);
+    y += 7 * 4 + 16;
+
+    if (duration > 0 && m->source == SRC_LOCAL) {
+        int frac = (int)(elapsed * 100.0 / duration);
+
+        frac = iclamp(frac, 0, 100);
+        fill_rect(fb, x, y, iw, 8, c_red_faint);
+        fill_rect(fb, x, y, iw * frac / 100, 8, c_red_bright);
+        fill_rect(fb, x, y + 8, iw, 1, c_red_dim);
+        y += 14;
+        fmt_time(timebuf, sizeof(timebuf), elapsed);
+        fmt_time(durbuf, sizeof(durbuf), duration);
+        draw_text(fb, x, y, timebuf, 2, c_text_dim);
+        draw_text(fb, x + iw - text_width(durbuf, 2), y, durbuf, 2,
+                  c_text_dim);
+        y += 14 + 12;
+    } else {
+        y += 6;
+    }
+
+    int hint_y = content_y + content_h - pad - 14;
+    int hints_h = 20 + 14 + 12;
+    int vu_h = imax(content_h / 4, 72);
+    int vu_y = content_y + content_h - pad - hints_h - vu_h;
+
+    if (vu_y > y)
+        draw_vu(fb, x, vu_y, iw, vu_h, active, mono_now(), c_red_dim, c_red,
+                c_orange, c_red_faint);
+
+    draw_text(fb, x, hint_y - 20, "UP/DOWN SELECT   ENTER PLAY   L/R SKIP",
+              2, c_text_dim);
+    draw_text(fb, x, hint_y, "ESC BACK   VOL +/-   MUTE", 2, c_red_dim);
+
+    /* Right: source list */
+    fill_rect(fb, rx, content_y, right_w, content_h, c_panel);
+    fill_rect(fb, rx, content_y, right_w, 2, c_red_dim);
+    fill_rect(fb, rx, content_y + content_h - 2, right_w, 2, c_red_dim);
+    fill_rect(fb, rx, content_y, 2, content_h, c_red_dim);
+    fill_rect(fb, rx + right_w - 2, content_y, 2, content_h, c_red_dim);
+
+    int px = rx + pad;
+    int pw = right_w - 2 * pad;
+    int py = content_y + pad;
+
+    draw_text(fb, px, py, "SOURCE", 2, c_red_dim);
+    snprintf(line, sizeof(line), "%d TRACK%s", m->track_count,
+             m->track_count == 1 ? "" : "S");
+    draw_text(fb, px + pw - text_width(line, 1), py + 3, line, 1, c_text_dim);
+    py += 14 + 14;
+
+    int row_h = imax(content_h / 16, 30);
+    int rows = (content_y + content_h - pad - py) / row_h;
+    int items = 1 + m->track_count;
+    int top = 0;
+
+    if (rows < 1)
+        rows = 1;
+    if (m->selected >= rows)
+        top = m->selected - rows + 1;
+    if (top > items - rows && items > rows)
+        top = items - rows;
+    if (top < 0)
+        top = 0;
+
+    for (int i = 0; i < rows; i++) {
+        int item = top + i;
+        int ry = py + i * row_h;
+        int sel;
+        char label[TRACK_NAME + 8];
+
+        if (item >= items)
+            break;
+        sel = (item == m->selected);
+
+        if (sel) {
+            fill_rect(fb, rx + 2, ry - 2, right_w - 4, row_h - 2,
+                      c_panel_sel);
+            fill_rect(fb, rx + 2, ry - 2, 4, row_h - 2, c_red_bright);
+        }
+
+        if (item == 0) {
+            snprintf(label, sizeof(label), "BLUETOOTH AUDIO");
+        } else {
+            snprintf(label, sizeof(label), "%02d  %s", item,
+                     m->tracks[item - 1].name);
+        }
+
+        draw_text_ellipsis(fb, rx + pad, ry, pw - 8, label, 2,
+                           sel ? c_red_bright : c_text);
+
+        if (item == 0 && m->source == SRC_BT) {
+            const char *tag = alsa_playback_running() ? "PLAY" : "IDLE";
+            draw_text(fb, rx + right_w - pad - text_width(tag, 1),
+                      ry + 4, tag, 1, c_orange);
+        }
+    }
+
+    if (m->track_count == 0) {
+        int ny = py + row_h + 8;
+
+        draw_text(fb, px, ny, "NO LOCAL TRACKS", 2, c_text_dim);
+        draw_text(fb, px, ny + 20, "ADD WAV OR MP3 TO /MEDIA", 1, c_red_dim);
+    }
+
+    draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
+}
+
+static void draw_scene(struct ui *ui)
+{
+    if (ui->screen == SCREEN_MEDIA)
+        draw_media(ui);
+    else
+        draw_home(ui);
+    fb_present(&ui->fb);
+}
+
+static int handle_global_key(struct ui *ui, int code)
+{
+    struct media *m = &ui->media;
+
+    switch (code) {
+    case KEY_VOLUMEUP:
+        audio_adjust(ui, 5);
+        return 1;
+    case KEY_VOLUMEDOWN:
+        audio_adjust(ui, -5);
+        return 1;
+    case KEY_MUTE:
+        m->muted = !m->muted;
+        audio_apply(ui);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void handle_home_key(struct ui *ui, int code, int *dirty)
+{
+    static const char *const names[4] = {
         "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
     };
 
@@ -372,22 +1477,13 @@ static void handle_key(struct ui *ui, int code, int *dirty)
         break;
     case KEY_ENTER:
     case KEY_KPENTER:
-        snprintf(ui->status, sizeof(ui->status), "%s SELECTED",
-                 names[ui->selected]);
-        *dirty = 1;
-        break;
-    case KEY_MUTE:
-        ui->muted = !ui->muted;
-        *dirty = 1;
-        break;
-    case KEY_VOLUMEUP:
-        if (ui->volume < 100)
-            ui->volume += 5;
-        *dirty = 1;
-        break;
-    case KEY_VOLUMEDOWN:
-        if (ui->volume > 0)
-            ui->volume -= 5;
+        if (ui->selected == 0) {
+            ui->screen = SCREEN_MEDIA;
+            snprintf(ui->status, sizeof(ui->status), "MEDIA");
+        } else {
+            snprintf(ui->status, sizeof(ui->status), "%s COMING SOON",
+                     names[ui->selected]);
+        }
         *dirty = 1;
         break;
     default:
@@ -395,105 +1491,63 @@ static void handle_key(struct ui *ui, int code, int *dirty)
     }
 }
 
-static void draw_scene(struct ui *ui)
+static void handle_media_key(struct ui *ui, int code, int *dirty)
 {
-    struct fb *fb = &ui->fb;
-    const int w = (int)fb->xres;
-    const int h = (int)fb->yres;
-    const uint32_t c_bg = color_pack(fb, 0x0A0F14);
-    const uint32_t c_panel = color_pack(fb, 0x111A22);
-    const uint32_t c_selected = color_pack(fb, 0x0F3038);
-    const uint32_t c_accent = color_pack(fb, 0x00C8B4);
-    const uint32_t c_amber = color_pack(fb, 0xFFB000);
-    const uint32_t c_text = color_pack(fb, 0xE6E6E6);
-    const uint32_t c_dim = color_pack(fb, 0x6E7F8A);
-    const int top_h = imax(h / 12, 40);
-    const int bottom_h = imax(h / 18, 26);
-    const int margin = imax(w / 64, 12);
-    const int gap = imax(w / 128, 8);
+    struct media *m = &ui->media;
 
-    static const char *const tiles[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
-    };
-    static const char *const subtitles[4] = {
-        "AUDIO / BLUETOOTH", "MAPS & ROUTES", "HANDS-FREE", "SYSTEM"
-    };
-
-    fill_rect(fb, 0, 0, w, h, c_bg);
-
-    /* Top bar */
-    fill_rect(fb, 0, 0, w, top_h, c_panel);
-    fill_rect(fb, 0, top_h - 2, w, 2, c_accent);
-
-    int title_scale = iclamp(w / 420, 2, 4);
-    draw_text(fb, margin, (top_h - 7 * title_scale) / 2, "OWLCAROS",
-              title_scale, c_accent);
-
-    char clockbuf[16];
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    strftime(clockbuf, sizeof(clockbuf), "%H:%M", &tm_now);
-    int clock_scale = title_scale;
-    draw_text(fb, w - margin - text_width(clockbuf, clock_scale),
-              (top_h - 7 * clock_scale) / 2, clockbuf, clock_scale, c_amber);
-
-    /* Main tiles */
-    int area_y = top_h + margin;
-    int area_h = h - top_h - bottom_h - 2 * margin;
-    int tile_w = (w - 2 * margin - gap) / 2;
-    int tile_h = (area_h - gap) / 2;
-    int label_scale = iclamp(w / 320, 2, 5);
-    int sub_scale = iclamp(w / 900, 1, 2);
-
-    for (int i = 0; i < 4; i++) {
-        int tx = margin + (i % 2) * (tile_w + gap);
-        int ty = area_y + (i / 2) * (tile_h + gap);
-        int selected = (i == ui->selected);
-        uint32_t border = selected ? c_accent : c_dim;
-
-        fill_rect(fb, tx, ty, tile_w, tile_h,
-                  selected ? c_selected : c_panel);
-        fill_rect(fb, tx, ty, tile_w, 2, border);
-        fill_rect(fb, tx, ty + tile_h - 2, tile_w, 2, border);
-        fill_rect(fb, tx, ty, 2, tile_h, border);
-        fill_rect(fb, tx + tile_w - 2, ty, 2, tile_h, border);
-
-        int lh = 7 * label_scale;
-        int sh = 7 * sub_scale;
-        int block_h = lh + 6 + sh;
-        int by = ty + (tile_h - block_h) / 2;
-
-        draw_text_centered(fb, tx, by, tile_w, tiles[i], label_scale,
-                           selected ? c_accent : c_text);
-        draw_text_centered(fb, tx, by + lh + 6, tile_w, subtitles[i],
-                           sub_scale, c_dim);
-
-        if (selected) {
-            int bar_w = imax(tile_w / 6, 24);
-            fill_rect(fb, tx + (tile_w - bar_w) / 2, ty + tile_h - 18,
-                      bar_w, 3, c_amber);
-        }
+    switch (code) {
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+        ui->screen = SCREEN_HOME;
+        *dirty = 1;
+        break;
+    case KEY_UP:
+        if (m->selected > 0)
+            m->selected--;
+        *dirty = 1;
+        break;
+    case KEY_DOWN:
+        if (m->selected < m->track_count)
+            m->selected++;
+        *dirty = 1;
+        break;
+    case KEY_ENTER:
+    case KEY_KPENTER:
+    case KEY_SPACE:
+        if (m->selected == 0)
+            bt_start(ui);
+        else
+            local_toggle(ui, m->selected - 1);
+        *dirty = 1;
+        break;
+    case KEY_LEFT:
+        local_skip(ui, -1);
+        *dirty = 1;
+        break;
+    case KEY_RIGHT:
+        local_skip(ui, 1);
+        *dirty = 1;
+        break;
+    case KEY_M:
+        m->muted = !m->muted;
+        audio_apply(ui);
+        *dirty = 1;
+        break;
+    default:
+        break;
     }
+}
 
-    /* Bottom status bar */
-    fill_rect(fb, 0, h - bottom_h, w, bottom_h, c_panel);
-    fill_rect(fb, 0, h - bottom_h, w, 2, c_accent);
-
-    char status[192];
-    snprintf(status, sizeof(status),
-             "BT %s   |   WIFI %s   |   VOL %s%3d   |   %s",
-             ui->bt_on ? "ON " : "OFF",
-             ui->wifi_on ? "ON " : "OFF",
-             ui->muted ? "MUTE " : "",
-             ui->volume,
-             ui->status[0] ? ui->status : "READY");
-
-    int status_scale = iclamp(w / 1280, 1, 2);
-    int sy = h - bottom_h + (bottom_h - 7 * status_scale) / 2;
-    draw_text(fb, margin, sy, status, status_scale, c_dim);
-
-    fb_present(fb);
+static void handle_key(struct ui *ui, int code, int *dirty)
+{
+    if (handle_global_key(ui, code)) {
+        *dirty = 1;
+        return;
+    }
+    if (ui->screen == SCREEN_MEDIA)
+        handle_media_key(ui, code, dirty);
+    else
+        handle_home_key(ui, code, dirty);
 }
 
 int main(void)
@@ -502,11 +1556,16 @@ int main(void)
     int inputs[MAX_INPUTS];
     int input_count;
     int dirty = 1;
-    time_t last_second = 0;
+    double next_draw = 0;
 
     memset(&ui, 0, sizeof(ui));
-    ui.volume = 50;
+    ui.screen = SCREEN_HOME;
+    ui.selected = 0;
     snprintf(ui.status, sizeof(ui.status), "READY");
+    ui.media.pid = -1;
+    ui.media.source = SRC_NONE;
+    ui.media.local_index = -1;
+    ui.media.selected = 0;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -523,46 +1582,55 @@ int main(void)
     input_count = input_open(inputs, MAX_INPUTS);
     fprintf(stderr, "owlcaros-ui: %d input device(s)\n", input_count);
 
+    audio_init(&ui);
+    media_scan(&ui);
+    fprintf(stderr, "owlcaros-ui: mixer '%s' volume %d, %d track(s)\n",
+            ui.media.mixer, ui.media.volume, ui.media.track_count);
+
     while (g_running) {
-        if (dirty) {
+        media_poll(&ui);
+
+        double now = mono_now();
+
+        if (dirty || now >= next_draw) {
             draw_scene(&ui);
             dirty = 0;
-            last_second = time(NULL);
+            next_draw = now + (ui.screen == SCREEN_MEDIA ? 0.15 : 0.5);
         }
 
         fd_set rfds;
         FD_ZERO(&rfds);
         int maxfd = -1;
+
         for (int i = 0; i < input_count; i++) {
             FD_SET(inputs[i], &rfds);
             if (inputs[i] > maxfd)
                 maxfd = inputs[i];
         }
 
-        struct timeval tv = { 1, 0 };
+        struct timeval tv = { 0, 80000 };
         int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
 
         if (ready > 0) {
             for (int i = 0; i < input_count; i++) {
+                struct input_event ev;
+                ssize_t n;
+
                 if (!FD_ISSET(inputs[i], &rfds))
                     continue;
 
-                struct input_event ev;
-                ssize_t n;
                 while ((n = read(inputs[i], &ev, sizeof(ev)))
                        == (ssize_t)sizeof(ev)) {
                     if (ev.type == EV_KEY && ev.value == 1)
                         handle_key(&ui, ev.code, &dirty);
                 }
             }
-        } else if (ready == 0) {
-            time_t now = time(NULL);
-            if (now != last_second)
-                dirty = 1;
         }
     }
 
     fprintf(stderr, "owlcaros-ui: exiting\n");
+    local_stop(&ui);
+    bt_resume(&ui);
     tty_text(ui.ttyfd);
     for (int i = 0; i < input_count; i++)
         close(inputs[i]);

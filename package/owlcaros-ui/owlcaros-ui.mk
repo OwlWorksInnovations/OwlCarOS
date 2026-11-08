@@ -16,6 +16,8 @@ endef
 
 define OWLCAROS_UI_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/owlcaros-ui $(TARGET_DIR)/usr/bin/owlcaros-ui
+	mkdir -p $(TARGET_DIR)/usr/share/owlcaros/media
+	cp -f $(@D)/media/*.wav $(TARGET_DIR)/usr/share/owlcaros/media/ 2>/dev/null || true
 endef
 
 $(eval $(generic-package))

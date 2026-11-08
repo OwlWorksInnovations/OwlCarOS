@@ -17,6 +17,17 @@ start() {
     else
         echo "FAIL"
     fi
+
+    # Let phones find the car without a shell. bluetoothd is started by S40,
+    # but allow it a moment to register on the system bus first.
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        (
+            sleep 3
+            printf 'power on\ndiscoverable on\npairable on\nquit\n' \
+                | bluetoothctl
+        ) >>/var/log/bluetooth-setup.log 2>&1 &
+    fi
+
     return "$status"
 }
 

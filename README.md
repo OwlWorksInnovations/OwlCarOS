@@ -2,7 +2,7 @@
 
 A custom, lightweight Linux-based car infotainment operating system.
 
-OwlCarOS is being developed for an celeron x86_64 laptop, with the goal of providing a high performance and early 2000s car infotainment interface. _possible theme support_
+OwlCarOS is being developed for a Celeron x86_64 laptop, with the goal of providing a high performance and early 2000s car infotainment interface.
 
 ## Current status
 
@@ -22,19 +22,69 @@ Current features:
 - QEMU UEFI boot tested
 - Broad Wi-Fi driver support (incl. wpa_supplicant and regulatory database)
 - Bluetooth audio support (BlueZ + bluealsa A2DP sink)
-- ALSA audio utilities (aplay/amixer)
+- A2DP playback through `bluealsa-aplay`, with discoverable/pairable mode
+- ALSA audio utilities (aplay/amixer) and MP3 playback via mpg123
 - Framebuffer/DRM console and display support
 - Native framebuffer UI shell (`owlcaros-ui`) with keyboard navigation
+- Red Audi TT (8N) inspired dot-matrix instrument-cluster theme
+- Media player for local WAV/MP3 files and Bluetooth audio
 - Boots straight into the dashboard; debug console on `tty2` and serial
 
 ## UI controls
 
 `owlcaros-ui` draws directly to `/dev/fb0` (no X11/Wayland) and reads
-`evdev` input, so any keyboard works.
+`evdev` input, so any keyboard works. The look is inspired by the red
+dot-matrix cluster of a 2004 Audi TT (8N): black panels, red LEDs and
+warm white markings.
 
-- Arrow keys: move between the four tiles
-- Enter: select the highlighted tile
-- Volume up/down and mute keys: adjust the status bar
+Home screen:
+
+- Arrow keys: move between Media, Navigation, Phone and Settings
+- Enter: open the highlighted tile
+- Volume up/down and mute keys: adjust the system mixer
+
+Media screen:
+
+- Up/Down: select the Bluetooth entry or a local track
+- Enter or Space: play/pause the selection (Enter on Bluetooth starts A2DP)
+- Left/Right: previous/next track
+- Volume up/down, M: volume and mute
+- Esc or Backspace: back to the home screen
+
+Local music is discovered in `/media`, `/run/media`, `/mnt`,
+`/root/Music` and `/usr/share/owlcaros/media`. WAV files play through
+`aplay`, MP3 files through `mpg123`. A short theme chime ships as a test
+track.
+
+When a local track starts, the UI pauses the Bluetooth A2DP player so
+both never fight over the ALSA device, then restarts it when playback
+ends. Phones can connect to the car while it is discoverable.
+
+## Audio
+
+The Intel HD Audio driver and its generic, Realtek, Cirrus and HDMI
+codecs are built into the kernel rather than as modules. The image has no
+modalias autoloading, so modular codecs would never bind and no sound card
+would appear at boot.
+
+A fresh ALSA state can leave the mixer muted or at 0%. On startup the UI
+picks the best playback control (`Master`, then `PCM`, `Speaker`, ...)
+and, if it is below 20%, unmutes it and sets it to 60%.
+
+To test audio in QEMU, add an emulated HDA card to the usual command line:
+
+```sh
+-audiodev pa,id=aud0 -device ich9-intel-hda -device hda-duplex,audiodev=aud0
+```
+
+Use `-audiodev none,id=aud0` for headless runs. Then check from the debug
+shell:
+
+```sh
+cat /proc/asound/cards
+amixer sget Master
+aplay /usr/share/owlcaros/media/owlcaros-theme.wav
+```
 
 The UI runs on `tty1`. Press `Ctrl+Alt+F2` for a debug shell (or use the
 serial console). Runtime information is written to
@@ -46,12 +96,12 @@ serial console). Runtime information is written to
 
 ## Planned features - feel free to make a pull request or issue if you want to add/suggest a feature/support
 
-- Bluetooth audio streaming from Android
-- ALSA audio output
+- Bluetooth track metadata and AVRCP controls
+- USB media auto-mounting
 - Wi-Fi hotspot connectivity
-- Online maps
+- Online maps and navigation
 - Full infotainment applications inside the native UI shell
-- 1990s / early-2000s automotive-inspired design and themes
+- Theme selection (TT red, B5 amber, cluster variants)
 
 ## Repository structure
 
@@ -68,10 +118,14 @@ OwlCarOS/
 │   └── owlcaros-ui/
 │       ├── Config.in
 │       ├── owlcaros-ui.mk
+│       ├── tools/
+│       │   └── make_chime.py
 │       └── src/
 │           ├── main.c
 │           ├── Makefile
-│           └── LICENSE
+│           ├── LICENSE
+│           └── media/
+│               └── owlcaros-theme.wav
 └── board/
     └── owlcaros/
         ├── post-build.sh
@@ -86,6 +140,7 @@ OwlCarOS/
         │       ├── inittab
         │       └── init.d/
         │           ├── S45bluealsa
+        │           ├── S46bluealsa-aplay
         │           └── S99owlcaros-ui
         └── staging/
             └── EFI/BOOT/
