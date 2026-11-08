@@ -57,6 +57,7 @@ For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; us
 - Test AVRCP metadata and controls with the target phone and confirm behavior across pause, track changes and disconnects
 - Test USB insertion/removal and audio playback from FAT, exFAT and NTFS3 drives on target hardware
 - Validate the installer on a spare internal disk and verify its boot entry
+- Build a graphical installer interface
 - Wi-Fi hotspot connectivity
 - Online maps and navigation
 - Functional Phone screen and additional system settings
