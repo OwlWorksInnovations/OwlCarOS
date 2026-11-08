@@ -1,8 +1,8 @@
 /*
- * owlcaros-ui - native framebuffer dashboard for OwlCarOS
+ * owlcaros-ui - SDL2 dashboard for OwlCarOS
  *
- * Draws directly to /dev/fb0 and reads keyboard events from evdev.
- * No X11, Wayland, SDL or other graphics stack required.
+ * Uses SDL2 with KMS/DRM and reads keyboard events from evdev.
+ *
  *
  * The visual language is inspired by the red dot-matrix instrument
  * cluster of the 2004 Audi TT (8N): black background, red LEDs and
@@ -16,10 +16,10 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/kd.h>
 #include <signal.h>
+#include <SDL.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,7 +27,6 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -142,11 +141,9 @@ static const uint16_t icon_settings[16] = {
 };
 
 struct fb {
-    int fd;
-    uint8_t *mem;
-    size_t mem_len;
-    struct fb_var_screeninfo var;
-    struct fb_fix_screeninfo fix;
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
     unsigned xres;
     unsigned yres;
     unsigned line_len;
@@ -242,21 +239,8 @@ static double mono_now(void)
 
 static uint32_t color_pack(const struct fb *fb, uint32_t rgb)
 {
-    unsigned r = (rgb >> 16) & 0xff;
-    unsigned g = (rgb >> 8) & 0xff;
-    unsigned b = rgb & 0xff;
-    uint32_t v = 0;
-
-    if (fb->var.red.length)
-        v |= ((r >> (8 - fb->var.red.length)) & ((1u << fb->var.red.length) - 1))
-             << fb->var.red.offset;
-    if (fb->var.green.length)
-        v |= ((g >> (8 - fb->var.green.length)) & ((1u << fb->var.green.length) - 1))
-             << fb->var.green.offset;
-    if (fb->var.blue.length)
-        v |= ((b >> (8 - fb->var.blue.length)) & ((1u << fb->var.blue.length) - 1))
-             << fb->var.blue.offset;
-    return v;
+    (void)fb;
+    return 0xff000000u | (rgb & 0x00ffffffu);
 }
 
 static void fill_rect(struct fb *fb, int x, int y, int w, int h, uint32_t color)
@@ -379,70 +363,98 @@ static void draw_icon(struct fb *fb, int x, int y, int dot,
 
 static void fb_present(struct fb *fb)
 {
-    memcpy(fb->mem, fb->back, (size_t)fb->line_len * fb->yres);
+    SDL_UpdateTexture(fb->texture, NULL, fb->back, (int)fb->line_len);
+    SDL_SetRenderDrawColor(fb->renderer, 0, 0, 0, 255);
+    SDL_RenderClear(fb->renderer);
+    SDL_RenderCopy(fb->renderer, fb->texture, NULL, NULL);
+    SDL_RenderPresent(fb->renderer);
 }
 
 static int fb_init(struct fb *fb)
 {
-    memset(fb, 0, sizeof(*fb));
-    fb->fd = -1;
+    SDL_DisplayMode mode;
+    int width = 1024;
+    int height = 600;
+    int window_width;
+    int window_height;
 
-    fb->fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
-    if (fb->fd < 0) {
-        perror("owlcaros-ui: open /dev/fb0");
+    memset(fb, 0, sizeof(*fb));
+    SDL_SetMainReady();
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
+        fprintf(stderr, "owlcaros-ui: SDL_Init: %s\n", SDL_GetError());
         return -1;
     }
-    if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &fb->var) < 0) {
-        perror("owlcaros-ui: FBIOGET_VSCREENINFO");
-        goto fail;
-    }
-    if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &fb->fix) < 0) {
-        perror("owlcaros-ui: FBIOGET_FSCREENINFO");
-        goto fail;
+
+    if (SDL_GetCurrentDisplayMode(0, &mode) == 0) {
+        width = mode.w;
+        height = mode.h;
     }
 
-    fb->xres = fb->var.xres;
-    fb->yres = fb->var.yres;
-    fb->bytes_pp = (fb->var.bits_per_pixel + 7) / 8;
-    fb->line_len = fb->fix.line_length;
-    fb->mem_len = fb->fix.smem_len ? fb->fix.smem_len
-                                   : (size_t)fb->line_len * fb->yres;
-
-    fb->mem = mmap(NULL, fb->mem_len, PROT_READ | PROT_WRITE, MAP_SHARED,
-                   fb->fd, 0);
-    if (fb->mem == MAP_FAILED) {
-        fb->mem = NULL;
-        perror("owlcaros-ui: mmap");
+    fb->window = SDL_CreateWindow("OwlCarOS", SDL_WINDOWPOS_UNDEFINED,
+                                  SDL_WINDOWPOS_UNDEFINED, width, height,
+                                  SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (fb->window == NULL) {
+        fprintf(stderr, "owlcaros-ui: SDL_CreateWindow: %s\n", SDL_GetError());
         goto fail;
     }
 
-    fb->back = malloc((size_t)fb->line_len * fb->yres);
+    fb->renderer = SDL_CreateRenderer(fb->window, -1,
+                                      SDL_RENDERER_ACCELERATED
+                                      | SDL_RENDERER_PRESENTVSYNC);
+    if (fb->renderer == NULL)
+        fb->renderer = SDL_CreateRenderer(fb->window, -1,
+                                          SDL_RENDERER_SOFTWARE);
+    if (fb->renderer == NULL) {
+        fprintf(stderr, "owlcaros-ui: SDL_CreateRenderer: %s\n",
+                SDL_GetError());
+        goto fail;
+    }
+
+    SDL_GetWindowSize(fb->window, &window_width, &window_height);
+    fb->xres = (unsigned)window_width;
+    fb->yres = (unsigned)window_height;
+    fb->bytes_pp = 4;
+    fb->line_len = fb->xres * fb->bytes_pp;
+    fb->back = calloc(fb->yres, fb->line_len);
     if (fb->back == NULL) {
-        perror("owlcaros-ui: malloc");
+        perror("owlcaros-ui: allocate SDL back buffer");
         goto fail;
     }
-    memset(fb->back, 0, (size_t)fb->line_len * fb->yres);
+
+    fb->texture = SDL_CreateTexture(fb->renderer, SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_STREAMING,
+                                    (int)fb->xres, (int)fb->yres);
+    if (fb->texture == NULL) {
+        fprintf(stderr, "owlcaros-ui: SDL_CreateTexture: %s\n",
+                SDL_GetError());
+        goto fail;
+    }
+    SDL_SetTextureBlendMode(fb->texture, SDL_BLENDMODE_NONE);
     return 0;
 
 fail:
-    if (fb->mem != NULL)
-        munmap(fb->mem, fb->mem_len);
     free(fb->back);
-    if (fb->fd >= 0)
-        close(fb->fd);
-    fb->mem = NULL;
     fb->back = NULL;
-    fb->fd = -1;
+    if (fb->texture != NULL)
+        SDL_DestroyTexture(fb->texture);
+    if (fb->renderer != NULL)
+        SDL_DestroyRenderer(fb->renderer);
+    if (fb->window != NULL)
+        SDL_DestroyWindow(fb->window);
+    SDL_Quit();
     return -1;
 }
 
 static void fb_close(struct fb *fb)
 {
-    if (fb->mem != NULL)
-        munmap(fb->mem, fb->mem_len);
+    if (fb->texture != NULL)
+        SDL_DestroyTexture(fb->texture);
+    if (fb->renderer != NULL)
+        SDL_DestroyRenderer(fb->renderer);
+    if (fb->window != NULL)
+        SDL_DestroyWindow(fb->window);
     free(fb->back);
-    if (fb->fd >= 0)
-        close(fb->fd);
+    SDL_Quit();
 }
 
 static int tty_graphics(void)
@@ -2135,8 +2147,8 @@ int main(void)
 
     ui.ttyfd = tty_graphics();
 
-    fprintf(stderr, "owlcaros-ui: framebuffer %ux%u %ubpp\n",
-            ui.fb.xres, ui.fb.yres, ui.fb.var.bits_per_pixel);
+    fprintf(stderr, "owlcaros-ui: SDL display %ux%u\n",
+            ui.fb.xres, ui.fb.yres);
 
     input_count = input_open(inputs, MAX_INPUTS);
     fprintf(stderr, "owlcaros-ui: %d input device(s)\n", input_count);
@@ -2147,6 +2159,7 @@ int main(void)
             ui.media.mixer, ui.media.volume, ui.media.track_count);
 
     while (g_running) {
+        SDL_PumpEvents();
         media_poll(&ui);
 
         double now = mono_now();

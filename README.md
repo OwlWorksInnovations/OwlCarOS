@@ -4,7 +4,7 @@ A lightweight Linux car infotainment system for x86_64 hardware, built with Buil
 
 ## Current project status
 
-**Early development.** The Buildroot image builds and has booted in QEMU. The latest image, including the System menu and live monitor, was flashed to the 64 GB SanDisk USB and read-back verified. Bluetooth AVRCP, USB auto-mounting and the installer still need runtime testing on the target hardware.
+**Early development.** The Buildroot image builds and has booted in QEMU. The SDL2/KMSDRM image was flashed to the 64 GB SanDisk and read-back verified. Startup, keyboard input, display compatibility and graphics performance still need testing on target hardware; the current image uses Mesa softpipe without hardware acceleration. Bluetooth AVRCP, USB auto-mounting and the installer also need target testing.
 
 The system currently includes:
 
@@ -15,7 +15,7 @@ The system currently includes:
 - System menu with confirmed reboot/shutdown actions and a live CPU, memory, uptime, load and process monitor
 - AVRCP track title and artist display, with play/pause/previous/next controls when the phone exposes a media player
 - Automatic read-only mounting of USB FAT, ext, exFAT and NTFS3 partitions under `/run/media`
-- A native framebuffer interface with keyboard navigation
+- A full-screen SDL2 interface using KMS/DRM with keyboard navigation
 - Local WAV and MP3 playback
 - Audio utilities and a startup mixer level adjustment
 - Battery percentage from Linux power-supply devices that identify as batteries; shows `--%` if no battery is detected
@@ -62,6 +62,7 @@ For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; us
 - Functional Phone screen and additional system settings
 - Theme selection (TT red, B5 amber and other cluster variants)
 - Verify battery reporting on the target laptop
+- Split the UI source into focused display, input, and screen modules for easier maintenance
 
 ## Repository structure
 

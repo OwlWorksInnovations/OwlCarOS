@@ -2,6 +2,7 @@
 
 DAEMON="owlcaros-ui"
 PIDFILE="/var/run/$DAEMON.pid"
+export SDL_VIDEODRIVER=kmsdrm
 DAEMON_PATH="/usr/bin/$DAEMON"
 LOG="/var/log/$DAEMON.log"
 

@@ -1,6 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 LDFLAGS ?=
+SDL_CFLAGS = $(shell $(PKG_CONFIG) --cflags sdl2)
+SDL_LIBS = $(shell $(PKG_CONFIG) --libs sdl2)
 
 TARGET = owlcaros-ui
 OBJS = main.o
@@ -8,10 +10,10 @@ OBJS = main.o
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(SDL_LIBS)
 
 main.o: main.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 clean:
 	rm -f $(OBJS) $(TARGET)
