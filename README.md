@@ -16,10 +16,15 @@ Current features:
 - GRUB2 UEFI bootloader
 - BusyBox userspace
 - musl C library
-- 256 MB ext4 root filesystem
+- 512 MB ext4 root filesystem
 - Custom OwlCarOS system identity
 - Automated disk image generation
 - QEMU UEFI boot tested
+- Broad Wi-Fi driver support (incl. wpa_supplicant and regulatory database)
+- Bluetooth audio support (BlueZ + bluealsa A2DP sink)
+- ALSA audio utilities (aplay/amixer)
+- Framebuffer/DRM console and display support
+- Login prompt on both the local display and serial console
 
 ## Planned features - feel free to make a pull request or issue if you want to add/suggest a feature/support
 
@@ -46,6 +51,16 @@ OwlCarOS/
         ├── post-build.sh
         ├── post-image.sh
         ├── genimage.cfg
+        ├── linux/
+        │   ├── wifi.config
+        │   ├── bluetooth.config
+        │   └── display.config
+        ├── rootfs-overlay/
+        │   └── etc/
+        │       ├── inittab
+        │       └── init.d/
+        │           └── S45bluealsa
         └── staging/
             └── EFI/BOOT/
                 └── grub.cfg
+```
