@@ -1,0 +1,22 @@
+#!/bin/sh
+case "$1" in
+    start)
+        mkdir -p /run/media
+        for node in /sys/class/block/sd*[0-9]; do
+            [ -e "$node" ] || continue
+            dev=${node##*/}
+            MDEV=$dev ACTION=add /sbin/owlcaros-usb-media
+        done
+        ;;
+    stop)
+        for mountpoint in /run/media/sd*; do
+            [ -d "$mountpoint" ] || continue
+            umount "$mountpoint" 2>/dev/null || true
+            rmdir "$mountpoint" 2>/dev/null || true
+        done
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac

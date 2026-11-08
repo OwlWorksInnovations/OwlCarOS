@@ -173,6 +173,9 @@ struct media {
     char mixer[48];
     int volume;
     int muted;
+    char bt_title[TRACK_NAME];
+    char bt_artist[TRACK_NAME];
+    char bt_status[24];
 };
 
 struct ui {
@@ -518,6 +521,55 @@ static void bt_aplay(int start)
 static int bt_adapter_present(void)
 {
     return access("/sys/class/bluetooth/hci0", F_OK) == 0;
+}
+
+static void bt_control(const char *action)
+{
+    run_cmd("bluetoothctl player %s >/dev/null 2>&1", action);
+}
+
+static void bt_metadata_refresh(struct media *m)
+{
+    FILE *p = popen("bluetoothctl player show 2>/dev/null", "r");
+    char line[256];
+    int has_track = 0;
+
+    if (p == NULL)
+        return;
+
+    while (fgets(line, sizeof(line), p) != NULL) {
+        char *value = NULL;
+        char *end;
+
+        if ((value = strstr(line, "Track.Title: ")) != NULL) {
+            value += strlen("Track.Title: ");
+            has_track = 1;
+            end = strpbrk(value, "\r\n");
+            if (end) *end = '\0';
+            if (strcmp(m->bt_title, value) != 0) {
+                snprintf(m->bt_title, sizeof(m->bt_title), "%s", value);
+            }
+        } else if ((value = strstr(line, "Track.Artist: ")) != NULL) {
+            value += strlen("Track.Artist: ");
+            end = strpbrk(value, "\r\n");
+            if (end) *end = '\0';
+            if (strcmp(m->bt_artist, value) != 0) {
+                snprintf(m->bt_artist, sizeof(m->bt_artist), "%s", value);
+            }
+        } else if ((value = strstr(line, "Status: ")) != NULL) {
+            value += strlen("Status: ");
+            end = strpbrk(value, "\r\n");
+            if (end) *end = '\0';
+            if (strcmp(m->bt_status, value) != 0) {
+                snprintf(m->bt_status, sizeof(m->bt_status), "%s", value);
+            }
+        }
+    }
+    pclose(p);
+    if (!has_track) {
+        m->bt_title[0] = '\0';
+        m->bt_artist[0] = '\0';
+    }
 }
 
 static int alsa_playback_running(void)
@@ -983,6 +1035,9 @@ static void bt_start(struct ui *ui)
     }
     if (!bt_aplay_running())
         bt_aplay(1);
+    bt_metadata_refresh(m);
+    if (m->bt_title[0])
+        bt_control("play");
     snprintf(ui->status, sizeof(ui->status), "BLUETOOTH AUDIO");
 }
 
@@ -1472,9 +1527,10 @@ static void draw_media(struct ui *ui)
     } else if (m->source == SRC_BT) {
         int streaming = alsa_playback_running();
 
-        title = "BLUETOOTH AUDIO";
+        title = m->bt_title[0] ? m->bt_title : "BLUETOOTH AUDIO";
         source = "A2DP";
-        state = streaming ? "STREAMING" : "WAITING FOR PHONE";
+        state = m->bt_status[0] ? m->bt_status
+                                : (streaming ? "STREAMING" : "WAITING FOR PHONE");
         active = streaming;
     }
 
@@ -1495,8 +1551,16 @@ static void draw_media(struct ui *ui)
               now_y, source, 1, c_red);
     draw_text_centered(fb, content_x, title_y, content_w, title,
                        scale, active ? c_red_bright : c_red);
-    draw_text_centered(fb, content_x, status_y, content_w, state,
-                       1, c_red_dim);
+    if (m->source == SRC_BT && m->bt_artist[0]) {
+        draw_text_centered(fb, content_x, status_y, content_w, m->bt_artist,
+                           1, c_red);
+        draw_text_centered(fb, content_x, status_y + 8, content_w, state,
+                           1, c_red_dim);
+        meter_y += 8;
+    } else {
+        draw_text_centered(fb, content_x, status_y, content_w, state,
+                           1, c_red_dim);
+    }
 
     if (duration > 0 && m->source == SRC_LOCAL) {
         int fraction = iclamp((int)(elapsed * 100.0 / duration), 0, 100);
@@ -1674,18 +1738,29 @@ static void handle_media_key(struct ui *ui, int code, int *dirty)
     case KEY_ENTER:
     case KEY_KPENTER:
     case KEY_SPACE:
-        if (m->selected == 0)
-            bt_start(ui);
-        else
+        if (m->selected == 0) {
+            if (m->source == SRC_BT && m->bt_title[0]) {
+                bt_control(!strcasecmp(m->bt_status, "playing") ? "pause" : "play");
+            } else {
+                bt_start(ui);
+            }
+        } else {
             local_toggle(ui, m->selected - 1);
+        }
         *dirty = 1;
         break;
     case KEY_LEFT:
-        local_skip(ui, -1);
+        if (m->selected == 0 && m->source == SRC_BT && m->bt_title[0])
+            bt_control("previous");
+        else
+            local_skip(ui, -1);
         *dirty = 1;
         break;
     case KEY_RIGHT:
-        local_skip(ui, 1);
+        if (m->selected == 0 && m->source == SRC_BT && m->bt_title[0])
+            bt_control("next");
+        else
+            local_skip(ui, 1);
         *dirty = 1;
         break;
     case KEY_M:
@@ -1717,6 +1792,8 @@ int main(void)
     int input_count;
     int dirty = 1;
     double next_draw = 0;
+    double next_bt_refresh = 0;
+    double next_media_refresh = 0;
 
     memset(&ui, 0, sizeof(ui));
     ui.screen = SCREEN_HOME;
@@ -1751,6 +1828,33 @@ int main(void)
         media_poll(&ui);
 
         double now = mono_now();
+        if (now >= next_bt_refresh) {
+            bt_metadata_refresh(&ui.media);
+            next_bt_refresh = now + 2.0;
+            if (ui.media.source == SRC_BT)
+                dirty = 1;
+        }
+        if (now >= next_media_refresh) {
+            char active_path[TRACK_PATH] = "";
+            int old_selected = ui.media.selected;
+            if (ui.media.source == SRC_LOCAL && ui.media.local_index >= 0
+                && ui.media.local_index < ui.media.track_count)
+                snprintf(active_path, sizeof(active_path), "%s",
+                         ui.media.tracks[ui.media.local_index].path);
+            media_scan(&ui);
+            if (active_path[0]) {
+                ui.media.local_index = -1;
+                for (int i = 0; i < ui.media.track_count; i++) {
+                    if (strcmp(ui.media.tracks[i].path, active_path) == 0) {
+                        ui.media.local_index = i;
+                        break;
+                    }
+                }
+            }
+            ui.media.selected = iclamp(old_selected, 0, ui.media.track_count);
+            next_media_refresh = now + 3.0;
+            dirty = 1;
+        }
 
         if (dirty || now >= next_draw) {
             draw_scene(&ui);

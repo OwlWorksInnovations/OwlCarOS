@@ -4,7 +4,7 @@ A lightweight Linux car infotainment system for x86_64 hardware, built with Buil
 
 ## Current project status
 
-**Early development.** The Buildroot image builds and has booted in QEMU. A recent image was prepared for USB testing. The latest installer and radio-style interface have not yet been fully validated on the target laptop and a separate installation disk.
+**Early development.** The Buildroot image builds and has booted in QEMU. The current image includes Bluetooth AVRCP metadata and controls plus USB media auto-mounting. These new features have been built but still need runtime testing with a paired phone and removable drives. The installer has not yet been validated on a real installation disk.
 
 The system currently includes:
 
@@ -12,6 +12,8 @@ The system currently includes:
 - UEFI boot through GRUB, with an automated disk installer
 - Wi-Fi drivers and wpa_supplicant
 - BlueZ Bluetooth pairing and A2DP audio playback through bluealsa
+- AVRCP track title and artist display, with play/pause/previous/next controls when the phone exposes a media player
+- Automatic read-only mounting of USB FAT, ext, exFAT and NTFS3 partitions under `/run/media`
 - A native framebuffer interface with keyboard navigation
 - Local WAV and MP3 playback
 - Audio utilities and a startup mixer level adjustment
@@ -27,7 +29,9 @@ In Media, Up/Down selects a source or track, Enter/Space plays or pauses, Left/R
 
 Local tracks are searched under `/media`, `/run/media`, `/mnt`, `/root/Music` and `/usr/share/owlcaros/media`. WAV uses `aplay`; MP3 uses `mpg123`. Starting local playback pauses Bluetooth playback until the local track ends.
 
-Bluetooth pairing is open under the name **OwlCarOS** and uses the BlueZ pairing agent. Bluetooth A2DP playback is available. AVRCP track metadata and media controls are not implemented yet. USB storage hotplug detection exists through mdev, but drives are not automatically mounted yet.
+Bluetooth pairing is open under the name **OwlCarOS** and uses the BlueZ pairing agent. Bluetooth A2DP playback is available. When the connected phone exposes an AVRCP media player, the Media screen shows its track title and artist; Enter/Space toggles play/pause, and Left/Right sends previous/next. Availability depends on the phone and its active media app.
+
+USB partitions with supported filesystems are mounted read-only at `/run/media/<device>` when inserted and unmounted when removed. The media list refreshes automatically. FAT, ext2/3/4, exFAT and NTFS3 are supported by the current kernel image. Filesystems outside that list are ignored.
 
 ## Installing to a hard drive
 
@@ -47,14 +51,16 @@ For a QEMU audio test, add:
 
 For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; use `Ctrl+Alt+F2` for a debug shell. UI logs are at `/var/log/owlcaros-ui.log`.
 
-## Planned work
+## Remaining work
 
-- Bluetooth track metadata and AVRCP controls
-- USB media auto-mounting and removal handling
+- Test AVRCP metadata and controls with the target phone and confirm behavior across pause, track changes and disconnects
+- Test USB insertion/removal and audio playback from FAT, exFAT and NTFS3 drives on target hardware
+- Validate the installer on a spare internal disk and verify its boot entry
 - Wi-Fi hotspot connectivity
 - Online maps and navigation
 - Functional Phone and Settings screens
 - Theme selection (TT red, B5 amber and other cluster variants)
+- Verify battery reporting on the target laptop
 
 ## Repository structure
 
@@ -80,15 +86,19 @@ OwlCarOS/
     ├── post-image.sh
     ├── genimage.cfg
     ├── linux/
-    ├── rootfs-overlay/
-    │   ├── sbin/owlcaros-installer-init
-    │   └── etc/
-    │       ├── bluetooth/main.conf
-    │       ├── inittab
-    │       └── init.d/
-    │           ├── S42bt-agent
-    │           ├── S45bluealsa
-    │           ├── S46bluealsa-aplay
-    │           └── S99owlcaros-ui
+    │   └── storage.config
+    └── rootfs-overlay/
+        ├── sbin/
+        │   ├── owlcaros-installer-init
+        │   └── owlcaros-usb-media
+        └── etc/
+            ├── bluetooth/main.conf
+            ├── inittab
+            └── init.d/
+                ├── S42bt-agent
+                ├── S45bluealsa
+                ├── S46bluealsa-aplay
+                ├── S48usb-media
+                └── S99owlcaros-ui
     └── staging/EFI/BOOT/grub.cfg
 ```

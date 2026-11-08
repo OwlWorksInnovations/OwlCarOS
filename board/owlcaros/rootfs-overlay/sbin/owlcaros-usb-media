@@ -1,0 +1,31 @@
+#!/bin/sh
+MEDIA_ROOT=/run/media
+mkdir -p "$MEDIA_ROOT"
+case "${ACTION:-add}" in
+    remove)
+        target="$MEDIA_ROOT/$MDEV"
+        if mountpoint -q "$target"; then
+            umount "$target" 2>/dev/null || umount -l "$target" 2>/dev/null || true
+        fi
+        rmdir "$target" 2>/dev/null || true
+        exit 0
+        ;;
+    add) ;;
+    *) exit 0 ;;
+esac
+case "$MDEV" in
+    sd[a-z][0-9]*) ;;
+    *) exit 0 ;;
+esac
+device="/dev/$MDEV"
+[ -b "$device" ] || exit 0
+type=$(blkid -o value -s TYPE "$device" 2>/dev/null)
+case "$type" in
+    vfat|fat|msdos|ext2|ext3|ext4|exfat|ntfs3) ;;
+    *) exit 0 ;;
+esac
+target="$MEDIA_ROOT/$MDEV"
+[ -d "$target" ] || mkdir -p "$target"
+if ! mountpoint -q "$target"; then
+    mount -t "$type" -o ro,nosuid,nodev,noexec "$device" "$target" 2>/dev/null || rmdir "$target" 2>/dev/null || true
+fi
