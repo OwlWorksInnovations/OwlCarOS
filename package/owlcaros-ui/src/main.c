@@ -1039,11 +1039,13 @@ static void media_poll(struct ui *ui)
 }
 
 
+
 static int battery_percent(void)
 {
     DIR *dir = opendir("/sys/class/power_supply");
     struct dirent *entry;
-    int fallback = -1;
+    int total = 0;
+    int count = 0;
 
     if (dir == NULL)
         return -1;
@@ -1069,28 +1071,24 @@ static int battery_percent(void)
         }
         fclose(f);
         type[strcspn(type, "\r\n")] = '\0';
+        if (strcasecmp(type, "Battery") != 0)
+            continue;
 
         snprintf(capacity_path, sizeof(capacity_path),
                  "/sys/class/power_supply/%s/capacity", entry->d_name);
         f = fopen(capacity_path, "r");
         if (f == NULL)
             continue;
-        if (fscanf(f, "%d", &percent) == 1) {
-            fclose(f);
-            if (percent < 0 || percent > 100)
-                continue;
-            fallback = percent;
-            if (strcasecmp(type, "Battery") == 0) {
-                closedir(dir);
-                return percent;
-            }
-        } else {
-            fclose(f);
+        if (fscanf(f, "%d", &percent) == 1
+            && percent >= 0 && percent <= 100) {
+            total += percent;
+            count++;
         }
+        fclose(f);
     }
 
     closedir(dir);
-    return fallback;
+    return count > 0 ? total / count : -1;
 }
 
 static void draw_top_bar(struct fb *fb, int w, int h, uint32_t panel,
@@ -1182,7 +1180,7 @@ static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
 
     draw_text(fb, margin, sy, left, scale, red_dim);
     draw_text(fb, group_x, sy, clockbuf, scale,
-              color_pack(fb, 0xF4E3DC));
+              red);
     draw_battery_icon(fb, group_x + clock_w + 5 * scale, icon_y, scale,
                       percent, red_dim, red);
     draw_text(fb, group_x + clock_w + 5 * scale + icon_w + 3 * scale,
@@ -1190,6 +1188,7 @@ static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
     draw_text(fb, w - margin - text_width(sound, scale), sy, sound, scale,
               red_dim);
 }
+
 
 
 static void draw_line(struct fb *fb, int x0, int y0, int x1, int y1,
@@ -1217,40 +1216,75 @@ static void draw_line(struct fb *fb, int x0, int y0, int x1, int y1,
     }
 }
 
+static void draw_radio_frame(struct fb *fb, int x, int y, int w, int h,
+                             uint32_t bright, uint32_t dim)
+{
+    int left = x + w / 4;
+    int right = x + (3 * w) / 4;
+    int cy = y + h / 2;
+    int arc_h = imax(h / 5, 24);
+    int curve = imax(w / 50, 12);
+
+    if (arc_h > h / 3)
+        arc_h = h / 3;
+    if (curve > 36)
+        curve = 36;
+
+    fill_rect(fb, x, y, w, 2, bright);
+    fill_rect(fb, x, y + h - 2, w, 2, dim);
+    fill_rect(fb, x, y, 2, h, dim);
+    fill_rect(fb, x + w - 2, y, 2, h, dim);
+    fill_rect(fb, x + 8, y + 8, w - 16, 1, dim);
+    fill_rect(fb, x + 8, y + h - 9, w - 16, 1, dim);
+
+    draw_line(fb, x + 2, cy - arc_h, left + curve, cy - arc_h, dim);
+    draw_line(fb, left + curve, cy - arc_h,
+              left + curve / 2, cy - arc_h / 2, bright);
+    draw_line(fb, left + curve / 2, cy - arc_h / 2, left, cy, bright);
+    draw_line(fb, left, cy, left + curve / 2, cy + arc_h / 2, bright);
+    draw_line(fb, left + curve / 2, cy + arc_h / 2,
+              left + curve, cy + arc_h, bright);
+    draw_line(fb, left + curve, cy + arc_h, x + 2, cy + arc_h, dim);
+
+    draw_line(fb, right - curve, cy - arc_h, x + w - 2, cy - arc_h, dim);
+    draw_line(fb, right - curve, cy - arc_h,
+              right - curve / 2, cy - arc_h / 2, bright);
+    draw_line(fb, right - curve / 2, cy - arc_h / 2, right, cy, bright);
+    draw_line(fb, right, cy, right - curve / 2, cy + arc_h / 2, bright);
+    draw_line(fb, right - curve / 2, cy + arc_h / 2,
+              right - curve, cy + arc_h, bright);
+    draw_line(fb, right - curve, cy + arc_h, x + w - 2, cy + arc_h, dim);
+
+    fill_rect(fb, left - 2, cy - 2, 4, 4, bright);
+    fill_rect(fb, right - 2, cy - 2, 4, 4, bright);
+}
+
 static void draw_home(struct ui *ui)
 {
     struct fb *fb = &ui->fb;
     const int w = (int)fb->xres;
     const int h = (int)fb->yres;
     const uint32_t c_bg = color_pack(fb, 0x000000);
-    const uint32_t c_panel = color_pack(fb, 0x120200);
-    const uint32_t c_panel_sel = color_pack(fb, 0x2A0503);
-    const uint32_t c_red = color_pack(fb, 0xD01408);
-    const uint32_t c_red_bright = color_pack(fb, 0xFF3B24);
-    const uint32_t c_red_dim = color_pack(fb, 0x6E150D);
-    const uint32_t c_glow = color_pack(fb, 0x330400);
-    const uint32_t c_glow_sel = color_pack(fb, 0x4A0500);
-    const uint32_t c_text = color_pack(fb, 0xF4E3DC);
-    const uint32_t c_text_dim = color_pack(fb, 0x9A5F57);
+    const uint32_t c_panel = color_pack(fb, 0x050000);
+    const uint32_t c_panel_sel = color_pack(fb, 0x210000);
+    const uint32_t c_red = color_pack(fb, 0xB00000);
+    const uint32_t c_red_bright = color_pack(fb, 0xFF0000);
+    const uint32_t c_red_dim = color_pack(fb, 0x680000);
     const int top_h = imax(h / 12, 40);
     const int bottom_h = imax(h / 18, 26);
     const int margin = imax(w / 64, 12);
-    const int panel_x = margin;
-    const int panel_y = top_h + margin / 2;
-    const int panel_w = imax(w - 2 * margin, 1);
-    const int panel_h = imax(h - panel_y - bottom_h - margin / 2, 1);
-    const int title_scale = iclamp(w / 420, 2, 3);
-    const int label_scale = iclamp(w / 480, 2, 3);
-    const int title_h = 7 * title_scale + 22;
-    const int hint_h = 7 + 12;
-    const int list_y = panel_y + title_h;
-    const int list_h = imax(panel_h - title_h - hint_h, 1);
-    const int row_h = imax(list_h / 4, 1);
-    const int pad = imax(w / 64, 14);
+    const int frame_x = margin;
+    const int frame_y = top_h + 4;
+    const int frame_w = imax(w - 2 * margin, 1);
+    const int frame_h = imax(h - top_h - bottom_h - 10, 1);
+    const int scale = iclamp(w / 500, 2, 3);
+    const int row_h = 7 * scale + 14;
+    const int list_h = row_h * 4;
+    int curve = imax(frame_w / 50, 12);
+    int list_w;
+    int list_x;
+    int list_y;
 
-    static const uint16_t *const icons[4] = {
-        icon_media, icon_navigation, icon_phone, icon_settings
-    };
     static const char *const titles[4] = {
         "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
     };
@@ -1259,64 +1293,49 @@ static void draw_home(struct ui *ui)
         "HANDS-FREE", "SYSTEM"
     };
 
+    if (curve > 36)
+        curve = 36;
+    list_w = imax(frame_w / 2 - 2 * curve, 1);
+    list_x = (w - list_w) / 2;
+    list_y = frame_y + frame_h / 2 - list_h / 2;
+
     fill_rect(fb, 0, 0, w, h, c_bg);
     draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
+    draw_radio_frame(fb, frame_x, frame_y, frame_w, frame_h,
+                     c_red_bright, c_red_dim);
 
-    /* Framed, two-tone list layout inspired by a classic car-radio display. */
-    fill_rect(fb, panel_x, panel_y, panel_w, panel_h, c_panel);
-    fill_rect(fb, panel_x, panel_y, panel_w, 2, c_red);
-    fill_rect(fb, panel_x, panel_y + panel_h - 2, panel_w, 2, c_red_dim);
-    fill_rect(fb, panel_x, panel_y, 2, panel_h, c_red_dim);
-    fill_rect(fb, panel_x + panel_w - 2, panel_y, 2, panel_h, c_red_dim);
-
-    draw_text_centered(fb, panel_x, panel_y + 7, panel_w, "SELECT A MODE",
-                       title_scale, c_red_bright);
-    fill_rect(fb, panel_x + 8, list_y - 4, panel_w - 16, 1, c_red_dim);
+    draw_text_centered(fb, list_x, list_y - 7 * scale - 13,
+                       list_w, "SELECT MODE", scale, c_red_bright);
+    fill_rect(fb, list_x, list_y - 4, list_w, 1, c_red_dim);
 
     for (int i = 0; i < 4; i++) {
         int y = list_y + i * row_h;
         int selected = i == ui->selected;
-        int dot = iclamp(row_h / 24, 1, 2);
-        int icon_px = 16 * dot;
-        int text_x = panel_x + pad + icon_px + imax(w / 96, 8);
-        int text_w = panel_x + panel_w - pad - text_x;
-        int text_block_h = 7 * label_scale + 10;
-        int text_y = y + (row_h - text_block_h) / 2;
-        uint32_t icon_on = selected ? c_red_bright : c_red_dim;
-        uint32_t icon_glow = selected ? c_glow_sel : c_glow;
+        int title_y = y + (row_h - (7 * scale + 8)) / 2;
+        int text_x = list_x + 12;
+        int text_w = list_w - 24;
+        uint32_t title_color = selected ? c_red_bright : c_red_dim;
+        uint32_t detail_color = selected ? c_red : c_red_dim;
 
         if (selected) {
-            fill_rect(fb, panel_x + 4, y + 1, panel_w - 8, row_h - 2,
+            fill_rect(fb, list_x + 2, y + 1, list_w - 4, row_h - 2,
                       c_panel_sel);
-            fill_rect(fb, panel_x + 4, y + 1, 3, row_h - 2, c_red_bright);
-            fill_rect(fb, panel_x + panel_w - 7, y + 1, 3, row_h - 2,
-                      c_red);
-        } else if (i > 0) {
-            fill_rect(fb, panel_x + 12, y, panel_w - 24, 1, c_red_dim);
-        }
-
-        if (i == 1) {
-            draw_line(fb, panel_x + 10, y + 4, panel_x + 5, y + row_h / 2,
+            fill_rect(fb, list_x + 2, y + 1, list_w - 4, 1, c_red_bright);
+            fill_rect(fb, list_x + 2, y + row_h - 2, list_w - 4, 1,
+                      c_red_bright);
+        } else {
+            fill_rect(fb, list_x + 8, y + row_h - 1, list_w - 16, 1,
                       c_red_dim);
-            draw_line(fb, panel_x + 5, y + row_h / 2,
-                      panel_x + 10, y + row_h - 5, c_red_dim);
-            draw_line(fb, panel_x + panel_w - 10, y + 4,
-                      panel_x + panel_w - 5, y + row_h / 2, c_red_dim);
-            draw_line(fb, panel_x + panel_w - 5, y + row_h / 2,
-                      panel_x + panel_w - 10, y + row_h - 5, c_red_dim);
         }
 
-        draw_icon(fb, panel_x + pad, y + (row_h - icon_px) / 2, dot,
-                  icons[i], icon_on, icon_glow);
-        draw_text_ellipsis(fb, text_x, text_y, text_w, titles[i],
-                           label_scale, selected ? c_red_bright : c_text);
-        draw_text_ellipsis(fb, text_x, text_y + 7 * label_scale + 3,
-                           text_w, details[i], 1,
-                           selected ? c_text_dim : c_red_dim);
+        draw_text_ellipsis(fb, text_x, title_y, text_w, titles[i], scale,
+                           title_color);
+        draw_text_ellipsis(fb, text_x, title_y + 7 * scale + 2,
+                           text_w, details[i], 1, detail_color);
     }
 
-    draw_text_centered(fb, panel_x, panel_y + panel_h - hint_h + 2,
-                       panel_w, "UP/DOWN SELECT   ENTER OPEN", 1, c_red_dim);
+    draw_text_centered(fb, frame_x, frame_y + frame_h - 18,
+                       frame_w, "UP/DOWN SELECT   ENTER OPEN", 1, c_red_dim);
     draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
 }
 
@@ -1383,47 +1402,63 @@ static void draw_vu(struct fb *fb, int x, int y, int w, int h, int active,
     }
 }
 
+
 static void draw_media(struct ui *ui)
 {
     struct fb *fb = &ui->fb;
     const int w = (int)fb->xres;
     const int h = (int)fb->yres;
     const uint32_t c_bg = color_pack(fb, 0x000000);
-    const uint32_t c_panel = color_pack(fb, 0x120200);
-    const uint32_t c_panel_sel = color_pack(fb, 0x2A0503);
-    const uint32_t c_red = color_pack(fb, 0xD01408);
-    const uint32_t c_red_bright = color_pack(fb, 0xFF3B24);
-    const uint32_t c_red_dim = color_pack(fb, 0x6E150D);
-    const uint32_t c_red_faint = color_pack(fb, 0x2A0A06);
-    const uint32_t c_glow = color_pack(fb, 0x330400);
-    const uint32_t c_text = color_pack(fb, 0xF4E3DC);
-    const uint32_t c_text_dim = color_pack(fb, 0x9A5F57);
-    const uint32_t c_orange = color_pack(fb, 0xFF4D00);
+    const uint32_t c_panel = color_pack(fb, 0x050000);
+    const uint32_t c_panel_sel = color_pack(fb, 0x210000);
+    const uint32_t c_red = color_pack(fb, 0xB00000);
+    const uint32_t c_red_bright = color_pack(fb, 0xFF0000);
+    const uint32_t c_red_dim = color_pack(fb, 0x680000);
+    const uint32_t c_red_faint = color_pack(fb, 0x260000);
+    const uint32_t c_glow = color_pack(fb, 0x260000);
     const int top_h = imax(h / 12, 40);
     const int bottom_h = imax(h / 18, 26);
     const int margin = imax(w / 64, 12);
-    const int gap = imax(w / 128, 8);
-    const int pad = imax(w / 48, 18);
+    const int frame_x = margin;
+    const int frame_y = top_h + 4;
+    const int frame_w = imax(w - 2 * margin, 1);
+    const int frame_h = imax(h - top_h - bottom_h - 10, 1);
+    const int scale = iclamp(w / 500, 2, 3);
+    int curve = imax(frame_w / 50, 12);
+    int content_w;
+    int content_x;
     struct media *m = &ui->media;
     const struct track *tr = NULL;
-    char timebuf[32];
+    char timebuf[16];
     char durbuf[16];
-    char line[128];
+    char line[TRACK_NAME + 16];
     const char *state = "IDLE";
     const char *source = "NO SOURCE";
     const char *title = "NO SOURCE";
     int active = 0;
     double elapsed = 0;
     double duration = 0;
-    int content_y = top_h + margin;
-    int content_h = h - top_h - bottom_h - 2 * margin;
-    int left_w = (w - 2 * margin - gap) * 3 / 5;
-    int right_w = w - 2 * margin - gap - left_w;
-    int lx = margin;
-    int rx = margin + left_w + gap;
+    int now_y;
+    int title_y;
+    int status_y;
+    int meter_y;
+    int list_header_y;
+    int rows_y;
+    int row_h = 7 * scale + 8;
+    int max_rows;
+    int rows;
+    int items = 1 + m->track_count;
+    int top = 0;
+
+    if (curve > 36)
+        curve = 36;
+    content_w = imax(frame_w / 2 - 2 * curve, 1);
+    content_x = (w - content_w) / 2;
 
     fill_rect(fb, 0, 0, w, h, c_bg);
     draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
+    draw_radio_frame(fb, frame_x, frame_y, frame_w, frame_h,
+                     c_red_bright, c_red_dim);
 
     if (m->source == SRC_LOCAL && m->local_index >= 0
         && m->local_index < m->track_count) {
@@ -1443,85 +1478,56 @@ static void draw_media(struct ui *ui)
         active = streaming;
     }
 
-    /* Left: now playing */
-    fill_rect(fb, lx, content_y, left_w, content_h, c_panel);
-    fill_rect(fb, lx, content_y, left_w, 2, c_red_dim);
-    fill_rect(fb, lx, content_y + content_h - 2, left_w, 2, c_red_dim);
-    fill_rect(fb, lx, content_y, 2, content_h, c_red_dim);
-    fill_rect(fb, lx + left_w - 2, content_y, 2, content_h, c_red_dim);
+    now_y = frame_y + frame_h / 7;
+    title_y = now_y + 7 * scale + 8;
+    status_y = title_y + 7 * scale + 5;
+    meter_y = status_y + 12;
+    list_header_y = frame_y + frame_h / 2 + 8;
+    rows_y = list_header_y + 15;
+    max_rows = (frame_y + frame_h - 27 - rows_y) / row_h;
+    if (max_rows > 5)
+        max_rows = 5;
+    if (max_rows < 1)
+        max_rows = 1;
 
-    int x = lx + pad;
-    int iw = left_w - 2 * pad;
-    int y = content_y + pad;
-
-    draw_text(fb, x, y, "NOW PLAYING", 2, c_red_dim);
-    y += 14 + 14;
-
-    draw_icon(fb, x, y, 3, icon_media, c_red, c_glow);
-    draw_text(fb, x + 16 * 3 + 16, y + 2, source, 2, c_orange);
-    draw_text(fb, x + 16 * 3 + 16, y + 2 + 18, state, 2,
-              active ? c_red_bright : c_text_dim);
-    y += 16 * 3 + 18;
-
-    draw_text_ellipsis(fb, x, y, iw, title, 4,
-                       m->source == SRC_NONE ? c_text_dim : c_text);
-    y += 7 * 4 + 16;
+    draw_text(fb, content_x + 4, now_y, "NOW PLAYING", 1, c_red_dim);
+    draw_text(fb, content_x + content_w - text_width(source, 1) - 4,
+              now_y, source, 1, c_red);
+    draw_text_centered(fb, content_x, title_y, content_w, title,
+                       scale, active ? c_red_bright : c_red);
+    draw_text_centered(fb, content_x, status_y, content_w, state,
+                       1, c_red_dim);
 
     if (duration > 0 && m->source == SRC_LOCAL) {
-        int frac = (int)(elapsed * 100.0 / duration);
+        int fraction = iclamp((int)(elapsed * 100.0 / duration), 0, 100);
+        int bar_x = content_x + 8;
+        int bar_w = content_w - 16;
 
-        frac = iclamp(frac, 0, 100);
-        fill_rect(fb, x, y, iw, 8, c_red_faint);
-        fill_rect(fb, x, y, iw * frac / 100, 8, c_red_bright);
-        fill_rect(fb, x, y + 8, iw, 1, c_red_dim);
-        y += 14;
+        fill_rect(fb, bar_x, meter_y, bar_w, 2, c_red_faint);
+        fill_rect(fb, bar_x, meter_y, bar_w * fraction / 100, 2,
+                  c_red_bright);
         fmt_time(timebuf, sizeof(timebuf), elapsed);
         fmt_time(durbuf, sizeof(durbuf), duration);
-        draw_text(fb, x, y, timebuf, 2, c_text_dim);
-        draw_text(fb, x + iw - text_width(durbuf, 2), y, durbuf, 2,
-                  c_text_dim);
-        y += 14 + 12;
+        draw_text(fb, bar_x, meter_y + 7, timebuf, 1, c_red_dim);
+        draw_text(fb, bar_x + bar_w - text_width(durbuf, 1),
+                  meter_y + 7, durbuf, 1, c_red_dim);
+    } else if (m->source == SRC_BT) {
+        draw_vu(fb, content_x + content_w / 4, meter_y,
+                content_w / 2, 22, active, mono_now(),
+                c_red_dim, c_red, c_red_bright, c_red_faint);
     } else {
-        y += 6;
+        fill_rect(fb, content_x + 8, meter_y, content_w - 16, 1, c_red_dim);
     }
 
-    int hint_y = content_y + content_h - pad - 14;
-    int hints_h = 20 + 14 + 12;
-    int vu_h = imax(content_h / 4, 72);
-    int vu_y = content_y + content_h - pad - hints_h - vu_h;
-
-    if (vu_y > y)
-        draw_vu(fb, x, vu_y, iw, vu_h, active, mono_now(), c_red_dim, c_red,
-                c_orange, c_red_faint);
-
-    draw_text(fb, x, hint_y - 20, "UP/DOWN SELECT   ENTER PLAY   L/R SKIP",
-              2, c_text_dim);
-    draw_text(fb, x, hint_y, "ESC BACK   VOL +/-   MUTE", 2, c_red_dim);
-
-    /* Right: source list */
-    fill_rect(fb, rx, content_y, right_w, content_h, c_panel);
-    fill_rect(fb, rx, content_y, right_w, 2, c_red_dim);
-    fill_rect(fb, rx, content_y + content_h - 2, right_w, 2, c_red_dim);
-    fill_rect(fb, rx, content_y, 2, content_h, c_red_dim);
-    fill_rect(fb, rx + right_w - 2, content_y, 2, content_h, c_red_dim);
-
-    int px = rx + pad;
-    int pw = right_w - 2 * pad;
-    int py = content_y + pad;
-
-    draw_text(fb, px, py, "SOURCE", 2, c_red_dim);
+    draw_line(fb, content_x, list_header_y - 4,
+              content_x + content_w, list_header_y - 4, c_red_dim);
     snprintf(line, sizeof(line), "%d TRACK%s", m->track_count,
              m->track_count == 1 ? "" : "S");
-    draw_text(fb, px + pw - text_width(line, 1), py + 3, line, 1, c_text_dim);
-    py += 14 + 14;
+    draw_text(fb, content_x + 4, list_header_y, "MEMORY", 1, c_red);
+    draw_text(fb, content_x + content_w - text_width(line, 1) - 4,
+              list_header_y, line, 1, c_red_dim);
 
-    int row_h = imax(content_h / 16, 30);
-    int rows = (content_y + content_h - pad - py) / row_h;
-    int items = 1 + m->track_count;
-    int top = 0;
-
-    if (rows < 1)
-        rows = 1;
+    rows = max_rows;
     if (m->selected >= rows)
         top = m->selected - rows + 1;
     if (top > items - rows && items > rows)
@@ -1531,44 +1537,54 @@ static void draw_media(struct ui *ui)
 
     for (int i = 0; i < rows; i++) {
         int item = top + i;
-        int ry = py + i * row_h;
-        int sel;
+        int y = rows_y + i * row_h;
+        int selected;
         char label[TRACK_NAME + 8];
 
         if (item >= items)
             break;
-        sel = (item == m->selected);
+        selected = item == m->selected;
 
-        if (sel) {
-            fill_rect(fb, rx + 2, ry - 2, right_w - 4, row_h - 2,
+        if (selected) {
+            fill_rect(fb, content_x + 2, y, content_w - 4, row_h - 1,
                       c_panel_sel);
-            fill_rect(fb, rx + 2, ry - 2, 4, row_h - 2, c_red_bright);
+            fill_rect(fb, content_x + 2, y, content_w - 4, 1,
+                      c_red_bright);
+            fill_rect(fb, content_x + 2, y + row_h - 2,
+                      content_w - 4, 1, c_red_bright);
+        } else {
+            fill_rect(fb, content_x + 10, y + row_h - 1,
+                      content_w - 20, 1, c_red_faint);
         }
 
-        if (item == 0) {
+        if (item == 0)
             snprintf(label, sizeof(label), "BLUETOOTH AUDIO");
-        } else {
+        else
             snprintf(label, sizeof(label), "%02d  %s", item,
                      m->tracks[item - 1].name);
-        }
 
-        draw_text_ellipsis(fb, rx + pad, ry, pw - 8, label, 2,
-                           sel ? c_red_bright : c_text);
+        draw_text_ellipsis(fb, content_x + 10, y + (row_h - 7 * scale) / 2,
+                           content_w - 20, label, scale,
+                           selected ? c_red_bright : c_red_dim);
 
         if (item == 0 && m->source == SRC_BT) {
             const char *tag = alsa_playback_running() ? "PLAY" : "IDLE";
-            draw_text(fb, rx + right_w - pad - text_width(tag, 1),
-                      ry + 4, tag, 1, c_orange);
+
+            draw_text(fb, content_x + content_w - 10 - text_width(tag, 1),
+                      y + (row_h - 7) / 2, tag, 1, c_red);
         }
     }
 
-    if (m->track_count == 0) {
-        int ny = py + row_h + 8;
-
-        draw_text(fb, px, ny, "NO LOCAL TRACKS", 2, c_text_dim);
-        draw_text(fb, px, ny + 20, "ADD WAV OR MP3 TO /MEDIA", 1, c_red_dim);
+    if (m->track_count == 0 && rows > 1) {
+        draw_text_centered(fb, content_x, rows_y + row_h, content_w,
+                           "NO LOCAL TRACKS", 1, c_red_dim);
+        draw_text_centered(fb, content_x, rows_y + row_h + 9, content_w,
+                           "ADD WAV OR MP3 TO /MEDIA", 1, c_red_dim);
     }
 
+    draw_text_centered(fb, frame_x, frame_y + frame_h - 18,
+                       frame_w, "UP/DOWN SELECT  ENTER PLAY  L/R SKIP  ESC BACK",
+                       1, c_red_dim);
     draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
 }
 
