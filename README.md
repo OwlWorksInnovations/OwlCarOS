@@ -2,12 +2,11 @@
 
 A custom, lightweight Linux-based car infotainment operating system.
 
-OwlCarOS is being developed for an celeron x86_64 laptop, with the goal of
-providing a simple, efficient and retro-inspired car infotainment interface. _possible theme support_
+OwlCarOS is being developed for an celeron x86_64 laptop, with the goal of providing a high performance and early 2000s car infotainment interface. _possible theme support_
 
 ## Current status
 
-**Early development — bootable baseline achieved.**
+**Early development**
 
 Current features:
 
@@ -22,14 +21,14 @@ Current features:
 - Automated disk image generation
 - QEMU UEFI boot tested
 
-## Planned features (feel free to make a pull request or issue if you want to add/suggest a feature/support)
+## Planned features - feel free to make a pull request or issue if you want to add/suggest a feature/support
 
 - Bluetooth audio streaming from Android
 - ALSA audio output
 - Wi-Fi hotspot connectivity
 - Online maps
 - Native C-based infotainment interface
-- Retro 1990s / early-2000s automotive-inspired design
+- 1990s / early-2000s automotive-inspired design
 
 ## Repository structure
 
