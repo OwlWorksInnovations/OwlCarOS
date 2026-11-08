@@ -1,122 +1,60 @@
 # OwlCarOS
 
-A custom, lightweight Linux-based car infotainment operating system.
+A lightweight Linux car infotainment system for x86_64 hardware, built with Buildroot.
 
-OwlCarOS is being developed for a Celeron x86_64 laptop, with the goal of providing a high performance and early 2000s car infotainment interface.
+## Current project status
 
-## Current status
+**Early development.** The Buildroot image builds and has booted in QEMU. A recent image was prepared for USB testing. The latest installer and radio-style interface have not yet been fully validated on the target laptop and a separate installation disk.
 
-**Early development**
+The system currently includes:
 
-Current features:
+- Buildroot 2026.02.3, Linux 6.18.7, BusyBox and musl
+- UEFI boot through GRUB, with an automated disk installer
+- Wi-Fi drivers and wpa_supplicant
+- BlueZ Bluetooth pairing and A2DP audio playback through bluealsa
+- A native framebuffer interface with keyboard navigation
+- Local WAV and MP3 playback
+- Audio utilities and a startup mixer level adjustment
+- Battery percentage from Linux power-supply devices that identify as batteries; shows `--%` if no battery is detected
 
-- Buildroot 2026.02.3
-- Linux kernel 6.18.7
-- x86_64 architecture
-- GRUB2 UEFI bootloader
-- BusyBox userspace
-- musl C library
-- 512 MB ext4 root filesystem
-- Custom OwlCarOS system identity
-- Automated disk image generation
-- QEMU UEFI boot tested
-- Broad Wi-Fi driver support (incl. wpa_supplicant and regulatory database)
-- Bluetooth audio support (BlueZ + bluealsa A2DP sink)
-- Automatic driver loading via BusyBox mdev (Wi-Fi/Bluetooth modules, USB hotplug)
-- A2DP playback through `bluealsa-aplay`, with discoverable/pairable mode
-- ALSA audio utilities (aplay/amixer) and MP3 playback via mpg123
-- Framebuffer/DRM console and display support
-- Native framebuffer UI shell (`owlcaros-ui`) with keyboard navigation
-- Red Audi TT (8N) inspired dot-matrix instrument-cluster theme
-- Media player for local WAV/MP3 files and Bluetooth audio
-- Boots straight into the dashboard; debug console on `tty2` and serial
+The home and media screens use the red Audi TT (8N) inspired radio styling. The installer is intended to install to an internal disk while protecting the boot USB. It asks the user to type the target device path before erasing it. Installation to a real disk still needs testing.
 
-## UI controls
+## Controls
 
-`owlcaros-ui` draws directly to `/dev/fb0` (no X11/Wayland) and reads
-`evdev` input, so any keyboard works. The look is inspired by the red
-dot-matrix cluster of a 2004 Audi TT (8N): black panels, red LEDs and
-warm white markings.
+On the home screen, use Up/Down to select Media, Navigation, Phone or Settings, then Enter to open. Navigation, Phone and Settings are currently placeholders.
 
-Home screen:
+In Media, Up/Down selects a source or track, Enter/Space plays or pauses, Left/Right selects the previous or next track, and Esc/Backspace returns home. Volume keys and M control volume and mute.
 
-- Arrow keys: move between Media, Navigation, Phone and Settings
-- Enter: open the highlighted tile
-- Volume up/down and mute keys: adjust the system mixer
+Local tracks are searched under `/media`, `/run/media`, `/mnt`, `/root/Music` and `/usr/share/owlcaros/media`. WAV uses `aplay`; MP3 uses `mpg123`. Starting local playback pauses Bluetooth playback until the local track ends.
 
-Media screen:
+Bluetooth pairing is open under the name **OwlCarOS** and uses the BlueZ pairing agent. Bluetooth A2DP playback is available. AVRCP track metadata and media controls are not implemented yet. USB storage hotplug detection exists through mdev, but drives are not automatically mounted yet.
 
-- Up/Down: select the Bluetooth entry or a local track
-- Enter or Space: play/pause the selection (Enter on Bluetooth starts A2DP)
-- Left/Right: previous/next track
-- Volume up/down, M: volume and mute
-- Esc or Backspace: back to the home screen
+## Installing to a hard drive
 
-Local music is discovered in `/media`, `/run/media`, `/mnt`,
-`/root/Music` and `/usr/share/owlcaros/media`. WAV files play through
-`aplay`, MP3 files through `mpg123`. A short theme chime ships as a test
-track.
+Boot the USB image and launch the installer from its GRUB menu. The installer lists available disks and excludes the boot USB. It requires typing the exact confirmation string for the selected device before it repartitions the disk, copies the system, expands the root filesystem, and updates the installed boot entry.
 
-When a local track starts, the UI pauses the Bluetooth A2DP player so
-both never fight over the ALSA device, then restarts it when playback
-ends.
+**The selected disk is erased.** Check the displayed model and size carefully. The installer has not yet been validated on a real target disk.
 
-The car shows up as **OwlCarOS** and is always discoverable and pairable.
-A `bt-agent` pairing agent (bluez-tools) accepts phones with "Just Works"
-pairing, so no PIN or on-screen confirmation is needed. If a phone tried
-to pair with an older build, forget the old entry on the phone first.
+## Audio notes
 
-If a phone pairs but drops the connection or never offers media audio,
-check that `bluetoothctl show` lists `Audio Sink`. BlueZ only links its
-A2DP/AVRCP plugins at build time, and Buildroot does not regenerate the
-plugin list when `BR2_PACKAGE_BLUEZ5_UTILS_PLUGINS_AUDIO` is toggled on an
-existing build. Rebuild BlueZ from scratch after changing its options:
+The kernel includes Intel HD Audio support and common codecs. If the mixer starts muted or very low, the UI attempts to unmute a playback control and set it to 60%.
 
-```sh
-make bluez5_utils-dirclean bluez-alsa-dirclean all
-```
-
-## Audio
-
-The Intel HD Audio driver and its generic, Realtek, Cirrus and HDMI
-codecs are built into the kernel, so the sound card is ready as soon as
-the kernel boots.
-
-A fresh ALSA state can leave the mixer muted or at 0%. On startup the UI
-picks the best playback control (`Master`, then `PCM`, `Speaker`, ...)
-and, if it is below 20%, unmutes it and sets it to 60%.
-
-To test audio in QEMU, add an emulated HDA card to the usual command line:
+For a QEMU audio test, add:
 
 ```sh
 -audiodev pa,id=aud0 -device ich9-intel-hda -device hda-duplex,audiodev=aud0
 ```
 
-Use `-audiodev none,id=aud0` for headless runs. Then check from the debug
-shell:
+For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; use `Ctrl+Alt+F2` for a debug shell. UI logs are at `/var/log/owlcaros-ui.log`.
 
-```sh
-cat /proc/asound/cards
-amixer sget Master
-aplay /usr/share/owlcaros/media/owlcaros-theme.wav
-```
-
-The UI runs on `tty1`. Press `Ctrl+Alt+F2` for a debug shell (or use the
-serial console). Runtime information is written to
-`/var/log/owlcaros-ui.log`; restart the UI with:
-
-```sh
-/etc/init.d/S99owlcaros-ui restart
-```
-
-## Planned features - feel free to make a pull request or issue if you want to add/suggest a feature/support
+## Planned work
 
 - Bluetooth track metadata and AVRCP controls
-- USB media auto-mounting
+- USB media auto-mounting and removal handling
 - Wi-Fi hotspot connectivity
 - Online maps and navigation
-- Full infotainment applications inside the native UI shell
-- Theme selection (TT red, B5 amber, cluster variants)
+- Functional Phone and Settings screens
+- Theme selection (TT red, B5 amber and other cluster variants)
 
 ## Repository structure
 
@@ -126,40 +64,31 @@ OwlCarOS/
 ├── external.desc
 ├── external.mk
 ├── README.md
-├── .gitignore
 ├── configs/
 │   └── owlcaros_x86_64_defconfig
 ├── package/
 │   └── owlcaros-ui/
 │       ├── Config.in
 │       ├── owlcaros-ui.mk
-│       ├── tools/
-│       │   └── make_chime.py
+│       ├── tools/make_chime.py
 │       └── src/
 │           ├── main.c
 │           ├── Makefile
-│           ├── LICENSE
-│           └── media/
-│               └── owlcaros-theme.wav
-└── board/
-    └── owlcaros/
-        ├── post-build.sh
-        ├── post-image.sh
-        ├── genimage.cfg
-        ├── linux/
-        │   ├── wifi.config
-        │   ├── bluetooth.config
-        │   └── display.config
-        ├── rootfs-overlay/
-        │   └── etc/
-        │       ├── bluetooth/main.conf
-        │       ├── inittab
-        │       └── init.d/
-        │           ├── S42bt-agent
-│           ├── S45bluealsa
-        │           ├── S46bluealsa-aplay
-        │           └── S99owlcaros-ui
-        └── staging/
-            └── EFI/BOOT/
-                └── grub.cfg
+│           └── media/owlcaros-theme.wav
+└── board/owlcaros/
+    ├── post-build.sh
+    ├── post-image.sh
+    ├── genimage.cfg
+    ├── linux/
+    ├── rootfs-overlay/
+    │   ├── sbin/owlcaros-installer-init
+    │   └── etc/
+    │       ├── bluetooth/main.conf
+    │       ├── inittab
+    │       └── init.d/
+    │           ├── S42bt-agent
+    │           ├── S45bluealsa
+    │           ├── S46bluealsa-aplay
+    │           └── S99owlcaros-ui
+    └── staging/EFI/BOOT/grub.cfg
 ```
