@@ -44,6 +44,7 @@
 
 #define SCREEN_HOME   0
 #define SCREEN_MEDIA  1
+#define SCREEN_SYSTEM 2
 
 #define SRC_NONE      0
 #define SRC_LOCAL     1
@@ -178,11 +179,33 @@ struct media {
     char bt_status[24];
 };
 
+struct proc_row {
+    int pid;
+    unsigned long rss_kb;
+    char name[32];
+};
+
+struct sys_info {
+    int cpu_percent;
+    int mem_percent;
+    unsigned long mem_total_kb;
+    unsigned long mem_used_kb;
+    unsigned long uptime_seconds;
+    int process_count;
+    char load[32];
+    struct proc_row top[5];
+    int top_count;
+};
+
 struct ui {
     struct fb fb;
     int ttyfd;
     int screen;
     int selected;
+    int system_selected;
+    int system_page; /* 0=menu, 1=monitor, 2=confirm */
+    int system_action; /* 1=reboot, 2=shutdown */
+    struct sys_info system;
     char status[64];
     struct media media;
 };
@@ -1194,7 +1217,8 @@ static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
                             uint32_t panel, uint32_t red, uint32_t red_dim)
 {
     const struct media *m = &ui->media;
-    const char *left = ui->screen == SCREEN_MEDIA ? "TUNING" : "MENU";
+    const char *left = ui->screen == SCREEN_MEDIA ? "TUNING"
+                     : ui->screen == SCREEN_SYSTEM ? "SYSTEM" : "MENU";
     char sound[32];
     char clockbuf[16];
     char batterybuf[8];
@@ -1341,11 +1365,11 @@ static void draw_home(struct ui *ui)
     int list_y;
 
     static const char *const titles[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
+        "MEDIA", "NAVIGATION", "PHONE", "SYSTEM"
     };
     static const char *const details[4] = {
         "BLUETOOTH AND LOCAL AUDIO", "MAPS AND ROUTES",
-        "HANDS-FREE", "SYSTEM"
+        "HANDS-FREE", "POWER AND STATUS"
     };
 
     if (curve > 36)
@@ -1652,10 +1676,259 @@ static void draw_media(struct ui *ui)
     draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
 }
 
+static void system_info_refresh(struct sys_info *info)
+{
+    static unsigned long long previous_total;
+    static unsigned long long previous_idle;
+    unsigned long long user = 0, nice = 0, system = 0, idle = 0;
+    unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    unsigned long long total, idle_total;
+    FILE *f;
+
+    f = fopen("/proc/stat", "r");
+    if (f != NULL) {
+        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &user, &nice, &system, &idle, &iowait, &irq,
+                   &softirq, &steal) >= 4) {
+            total = user + nice + system + idle + iowait + irq + softirq + steal;
+            idle_total = idle + iowait;
+            if (previous_total && total > previous_total) {
+                unsigned long long dt = total - previous_total;
+                unsigned long long di = idle_total - previous_idle;
+                info->cpu_percent = (int)((dt - di) * 100 / dt);
+            }
+            previous_total = total;
+            previous_idle = idle_total;
+        }
+        fclose(f);
+    }
+
+    info->mem_total_kb = 0;
+    info->mem_used_kb = 0;
+    f = fopen("/proc/meminfo", "r");
+    if (f != NULL) {
+        char line[160];
+        unsigned long available = 0, free_kb = 0, buffers = 0, cached = 0;
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (sscanf(line, "MemTotal: %lu kB", &info->mem_total_kb) == 1)
+                continue;
+            if (sscanf(line, "MemAvailable: %lu kB", &available) == 1)
+                continue;
+            if (sscanf(line, "MemFree: %lu kB", &free_kb) == 1)
+                continue;
+            if (sscanf(line, "Buffers: %lu kB", &buffers) == 1)
+                continue;
+            if (sscanf(line, "Cached: %lu kB", &cached) == 1)
+                continue;
+        }
+        fclose(f);
+        if (info->mem_total_kb) {
+            unsigned long unused = available ? available : free_kb + buffers + cached;
+            info->mem_used_kb = unused < info->mem_total_kb
+                              ? info->mem_total_kb - unused : 0;
+            info->mem_percent = (int)(info->mem_used_kb * 100 /
+                                      info->mem_total_kb);
+        }
+    }
+
+    {
+        double uptime = 0;
+        f = fopen("/proc/uptime", "r");
+        if (f != NULL) {
+            (void)fscanf(f, "%lf", &uptime);
+            fclose(f);
+        }
+        info->uptime_seconds = (unsigned long)uptime;
+    }
+
+    snprintf(info->load, sizeof(info->load), "N/A");
+    f = fopen("/proc/loadavg", "r");
+    if (f != NULL) {
+        (void)fscanf(f, "%31s", info->load);
+        fclose(f);
+    }
+
+    info->process_count = 0;
+    info->top_count = 0;
+    {
+        DIR *proc = opendir("/proc");
+        struct dirent *entry;
+        if (proc != NULL) {
+            while ((entry = readdir(proc)) != NULL) {
+                char path[64], name[32] = "?";
+                int pid;
+                unsigned long rss = 0;
+                FILE *status;
+                if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
+                    continue;
+                pid = atoi(entry->d_name);
+                if (pid <= 0)
+                    continue;
+                info->process_count++;
+                snprintf(path, sizeof(path), "/proc/%d/status", pid);
+                status = fopen(path, "r");
+                if (status == NULL)
+                    continue;
+                {
+                    char line[160];
+                    while (fgets(line, sizeof(line), status) != NULL) {
+                        if (strncmp(line, "Name:", 5) == 0)
+                            (void)sscanf(line + 5, "%31s", name);
+                        else if (sscanf(line, "VmRSS: %lu kB", &rss) == 1)
+                            break;
+                    }
+                }
+                fclose(status);
+                if (!rss)
+                    continue;
+
+                int pos = info->top_count;
+                if (pos > 4)
+                    pos = 4;
+                if (info->top_count == 5 && rss <= info->top[4].rss_kb)
+                    continue;
+                if (info->top_count < 5)
+                    info->top_count++;
+                while (pos > 0 && rss > info->top[pos - 1].rss_kb) {
+                    if (pos < 5)
+                        info->top[pos] = info->top[pos - 1];
+                    pos--;
+                }
+                info->top[pos].pid = pid;
+                info->top[pos].rss_kb = rss;
+                snprintf(info->top[pos].name, sizeof(info->top[pos].name),
+                         "%s", name);
+            }
+            closedir(proc);
+        }
+    }
+}
+
+static void draw_system(struct ui *ui)
+{
+    struct fb *fb = &ui->fb;
+    const int w = (int)fb->xres, h = (int)fb->yres;
+    const uint32_t bg = color_pack(fb, 0x000000);
+    const uint32_t panel = color_pack(fb, 0x050000);
+    const uint32_t selected = color_pack(fb, 0x210000);
+    const uint32_t red = color_pack(fb, 0xB00000);
+    const uint32_t bright = color_pack(fb, 0xFF0000);
+    const uint32_t dim = color_pack(fb, 0x680000);
+    const uint32_t faint = color_pack(fb, 0x260000);
+    int top_h = imax(h / 12, 40), bottom_h = imax(h / 18, 26);
+    int margin = imax(w / 64, 12);
+    int fx = margin, fy = top_h + 4;
+    int fw = imax(w - 2 * margin, 1);
+    int fh = imax(h - top_h - bottom_h - 10, 1);
+    int scale = iclamp(w / 500, 2, 3);
+    char text[128];
+
+    fill_rect(fb, 0, 0, w, h, bg);
+    draw_top_bar(fb, w, h, panel, red, bright);
+    draw_radio_frame(fb, fx, fy, fw, fh, bright, dim);
+
+    if (ui->system_page == 0) {
+        static const char *const titles[] = { "REBOOT", "SHUTDOWN", "SYSTEM INFO" };
+        static const char *const details[] = {
+            "RESTART OWLCAROS", "POWER OFF DEVICE", "CPU, MEMORY, LOAD, PROCESSES"
+        };
+        int row_h = 7 * scale + 18;
+        int list_h = row_h * 3;
+        int list_w = imax(fw / 2 - 24, 1);
+        int list_x = (w - list_w) / 2;
+        int list_y = fy + fh / 2 - list_h / 2;
+
+        draw_text_centered(fb, fx, fy + fh / 8, fw, "SYSTEM", scale, bright);
+        for (int i = 0; i < 3; i++) {
+            int y = list_y + i * row_h;
+            int ty = y + (row_h - 7 * scale - 8) / 2;
+            if (i == ui->system_selected) {
+                fill_rect(fb, list_x, y + 1, list_w, row_h - 2, selected);
+                fill_rect(fb, list_x, y + 1, list_w, 1, bright);
+                fill_rect(fb, list_x, y + row_h - 2, list_w, 1, bright);
+            } else {
+                fill_rect(fb, list_x + 8, y + row_h - 1, list_w - 16, 1, dim);
+            }
+            draw_text_centered(fb, list_x, ty, list_w, titles[i], scale,
+                               i == ui->system_selected ? bright : dim);
+            draw_text_centered(fb, list_x, ty + 7 * scale + 2, list_w,
+                               details[i], 1, red);
+        }
+        draw_text_centered(fb, fx, fy + fh - 18, fw,
+                           "UP/DOWN SELECT   ENTER OPEN   ESC BACK", 1, dim);
+    } else if (ui->system_page == 2) {
+        const char *action = ui->system_action == 1 ? "REBOOT OWLCAROS?"
+                                                     : "SHUT DOWN OWLCAROS?";
+        draw_text_centered(fb, fx, fy + fh / 3, fw, action, scale, bright);
+        draw_text_centered(fb, fx, fy + fh / 2, fw,
+                           "ENTER CONFIRM   ESC CANCEL", 1, red);
+        draw_text_centered(fb, fx, fy + fh / 2 + 14, fw,
+                           "UNSAVED WORK WILL BE LOST", 1, dim);
+    } else {
+        const struct sys_info *si = &ui->system;
+        int x = fx + imax(fw / 5, 24);
+        int usable_w = fw - 2 * (x - fx);
+        int y = fy + fh / 8;
+        int bar_w = imax(usable_w - 100, 1);
+        int bar_h = 7;
+        char uptime[48];
+        unsigned long days = si->uptime_seconds / 86400;
+        unsigned long hours = (si->uptime_seconds / 3600) % 24;
+        unsigned long minutes = (si->uptime_seconds / 60) % 60;
+
+        snprintf(uptime, sizeof(uptime), "%lu d %02lu:%02lu", days, hours, minutes);
+        draw_text_centered(fb, fx, fy + 12, fw, "LIVE SYSTEM MONITOR", scale, bright);
+
+        snprintf(text, sizeof(text), "CPU  %3d%%", si->cpu_percent);
+        draw_text(fb, x, y, text, 1, red);
+        fill_rect(fb, x + 100, y + 2, bar_w, bar_h, faint);
+        fill_rect(fb, x + 100, y + 2, bar_w * iclamp(si->cpu_percent, 0, 100) / 100,
+                  bar_h, bright);
+
+        y += 18;
+        if (si->mem_total_kb)
+            snprintf(text, sizeof(text), "MEM  %3d%%  %lu / %lu MB",
+                     si->mem_percent, si->mem_used_kb / 1024,
+                     si->mem_total_kb / 1024);
+        else
+            snprintf(text, sizeof(text), "MEM  UNAVAILABLE");
+        draw_text(fb, x, y, text, 1, red);
+        fill_rect(fb, x + 100, y + 9, bar_w, bar_h, faint);
+        fill_rect(fb, x + 100, y + 9,
+                  bar_w * iclamp(si->mem_percent, 0, 100) / 100, bar_h, bright);
+
+        y += 25;
+        snprintf(text, sizeof(text), "LOAD %s    UPTIME %s    TASKS %d",
+                 si->load, uptime, si->process_count);
+        draw_text_ellipsis(fb, x, y, usable_w, text, 1, dim);
+
+        y += 18;
+        fill_rect(fb, x, y, usable_w, 1, dim);
+        y += 7;
+        draw_text(fb, x, y, "PID     PROCESS                 RESIDENT", 1, red);
+        y += 12;
+        for (int i = 0; i < 5; i++) {
+            if (i < si->top_count)
+                snprintf(text, sizeof(text), "%-6d  %-22.22s %5lu MB",
+                         si->top[i].pid, si->top[i].name,
+                         si->top[i].rss_kb / 1024);
+            else
+                snprintf(text, sizeof(text), "--      --                      --");
+            draw_text(fb, x, y + i * 11, text, 1, i == 0 ? bright : dim);
+        }
+        draw_text_centered(fb, fx, fy + fh - 18, fw,
+                           "LIVE CPU / MEMORY / PROCESS SUMMARY   ESC BACK", 1, dim);
+    }
+
+    draw_bottom_bar(fb, ui, w, h, panel, red, dim);
+}
+
 static void draw_scene(struct ui *ui)
 {
     if (ui->screen == SCREEN_MEDIA)
         draw_media(ui);
+    else if (ui->screen == SCREEN_SYSTEM)
+        draw_system(ui);
     else
         draw_home(ui);
     fb_present(&ui->fb);
@@ -1685,7 +1958,7 @@ static int handle_global_key(struct ui *ui, int code)
 static void handle_home_key(struct ui *ui, int code, int *dirty)
 {
     static const char *const names[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
+        "MEDIA", "NAVIGATION", "PHONE", "SYSTEM"
     };
 
     switch (code) {
@@ -1704,6 +1977,10 @@ static void handle_home_key(struct ui *ui, int code, int *dirty)
         if (ui->selected == 0) {
             ui->screen = SCREEN_MEDIA;
             snprintf(ui->status, sizeof(ui->status), "MEDIA");
+        } else if (ui->selected == 3) {
+            ui->screen = SCREEN_SYSTEM;
+            ui->system_page = 0;
+            ui->system_selected = 0;
         } else {
             snprintf(ui->status, sizeof(ui->status), "%s COMING SOON",
                      names[ui->selected]);
@@ -1773,6 +2050,50 @@ static void handle_media_key(struct ui *ui, int code, int *dirty)
     }
 }
 
+static void handle_system_key(struct ui *ui, int code, int *dirty)
+{
+    if (code == KEY_ESC || code == KEY_BACKSPACE) {
+        if (ui->system_page == 2) {
+            ui->system_page = 0;
+        } else if (ui->system_page == 1) {
+            ui->system_page = 0;
+        } else {
+            ui->screen = SCREEN_HOME;
+        }
+        *dirty = 1;
+        return;
+    }
+
+    if (ui->system_page == 0) {
+        if (code == KEY_UP)
+            ui->system_selected = ui->system_selected > 0
+                                ? ui->system_selected - 1 : 2;
+        else if (code == KEY_DOWN)
+            ui->system_selected = ui->system_selected < 2
+                                ? ui->system_selected + 1 : 0;
+        else if (code == KEY_ENTER || code == KEY_KPENTER) {
+            if (ui->system_selected == 2) {
+                ui->system_page = 1;
+                system_info_refresh(&ui->system);
+            } else {
+                ui->system_action = ui->system_selected == 0 ? 1 : 2;
+                ui->system_page = 2;
+            }
+        } else {
+            return;
+        }
+    } else if (ui->system_page == 2
+               && (code == KEY_ENTER || code == KEY_KPENTER)) {
+        if (ui->system_action == 1)
+            run_cmd("/sbin/reboot");
+        else
+            run_cmd("/sbin/poweroff");
+    } else {
+        return;
+    }
+    *dirty = 1;
+}
+
 static void handle_key(struct ui *ui, int code, int *dirty)
 {
     if (handle_global_key(ui, code)) {
@@ -1781,6 +2102,8 @@ static void handle_key(struct ui *ui, int code, int *dirty)
     }
     if (ui->screen == SCREEN_MEDIA)
         handle_media_key(ui, code, dirty);
+    else if (ui->screen == SCREEN_SYSTEM)
+        handle_system_key(ui, code, dirty);
     else
         handle_home_key(ui, code, dirty);
 }
@@ -1794,6 +2117,7 @@ int main(void)
     double next_draw = 0;
     double next_bt_refresh = 0;
     double next_media_refresh = 0;
+    double next_system_refresh = 0;
 
     memset(&ui, 0, sizeof(ui));
     ui.screen = SCREEN_HOME;
@@ -1833,6 +2157,12 @@ int main(void)
             next_bt_refresh = now + 2.0;
             if (ui.media.source == SRC_BT)
                 dirty = 1;
+        }
+        if (ui.screen == SCREEN_SYSTEM && ui.system_page == 1
+            && now >= next_system_refresh) {
+            system_info_refresh(&ui.system);
+            next_system_refresh = now + 1.0;
+            dirty = 1;
         }
         if (now >= next_media_refresh) {
             char active_path[TRACK_PATH] = "";

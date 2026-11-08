@@ -23,7 +23,7 @@ The home and media screens use the red Audi TT (8N) inspired radio styling. The 
 
 ## Controls
 
-On the home screen, use Up/Down to select Media, Navigation, Phone or Settings, then Enter to open. Navigation, Phone and Settings are currently placeholders.
+On the home screen, use Up/Down to select Media, Navigation, Phone or System, then Enter to open. Navigation and Phone are currently placeholders. The System menu provides reboot, shutdown and System Info. Reboot and shutdown require a second Enter press on a confirmation screen. System Info shows live CPU and memory use, load average, uptime, task count and the five processes using the most resident memory.
 
 In Media, Up/Down selects a source or track, Enter/Space plays or pauses, Left/Right selects the previous or next track, and Esc/Backspace returns home. Volume keys and M control volume and mute.
 
@@ -58,7 +58,7 @@ For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; us
 - Validate the installer on a spare internal disk and verify its boot entry
 - Wi-Fi hotspot connectivity
 - Online maps and navigation
-- Functional Phone and Settings screens
+- Functional Phone screen and additional system settings
 - Theme selection (TT red, B5 amber and other cluster variants)
 - Verify battery reporting on the target laptop
 
