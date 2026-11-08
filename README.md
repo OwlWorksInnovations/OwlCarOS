@@ -1,4 +1,3 @@
-cat > README.md <<'EOF'
 # OwlCarOS
 
 A custom, lightweight Linux-based car infotainment operating system.
@@ -23,7 +22,7 @@ Current features:
 - Automated disk image generation
 - QEMU UEFI boot tested
 
-## Planned features
+## Planned features (feel free to make a pull request or issue if you want to add/suggest a feature/support)
 
 - Bluetooth audio streaming from Android
 - ALSA audio output
