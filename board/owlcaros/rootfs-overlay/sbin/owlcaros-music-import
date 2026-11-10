@@ -1,0 +1,76 @@
+#!/bin/sh
+# Copy WAV and MP3 files from every mounted USB drive into the music
+# library, keeping their folders. Progress goes to a one-line status file
+# that the Media screen shows next to "COPY USB MUSIC TO LIBRARY".
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+SRC_ROOT=/run/media
+DEST=/root/Music
+STATUS=/run/owlcaros-import.status
+LOCK=/run/owlcaros-import.lock
+LIST=/run/owlcaros-import.list
+RESERVE_KB=20480        # keep 20 MB free in the library
+
+status() {
+    printf '%s\n' "$*" > "$STATUS.tmp" && mv "$STATUS.tmp" "$STATUS"
+}
+
+# One import at a time.
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rm -rf "$LOCK" "$LIST"' EXIT INT TERM
+
+mkdir -p "$DEST"
+find "$DEST" -name '*.part' -type f -exec rm -f {} + 2>/dev/null
+
+status "SCANNING USB"
+: > "$LIST"
+for src in "$SRC_ROOT"/*; do
+    [ -d "$src" ] || continue
+    find "$src" -type f \( -iname '*.mp3' -o -iname '*.wav' \) \
+        ! -path '*/.*' ! -path '*/$RECYCLE.BIN/*' \
+        ! -path '*/System Volume Information/*' ! -path '*/LOST.DIR/*' \
+        ! -path '*/lost+found/*' >> "$LIST" 2>/dev/null
+done
+
+total=$(wc -l < "$LIST")
+if [ "$total" -eq 0 ]; then
+    status "NO MUSIC FOUND ON USB"
+    exit 0
+fi
+
+n=0
+copied=0
+skipped=0
+failed=0
+while IFS= read -r file; do
+    n=$((n + 1))
+    rel=${file#"$SRC_ROOT"/*/}
+    dest="$DEST/$rel"
+
+    if [ -e "$dest" ]; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    size_kb=$(( ($(stat -c %s "$file") + 1023) / 1024 ))
+    free_kb=$(df -k -P "$DEST" | awk 'NR == 2 { print $4 }')
+    if [ $((size_kb + RESERVE_KB)) -gt "${free_kb:-0}" ]; then
+        sync
+        status "LIBRARY FULL - $copied OF $total COPIED"
+        exit 0
+    fi
+
+    status "COPYING $n OF $total"
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+    if cp "$file" "$dest.part" 2>/dev/null && mv "$dest.part" "$dest"; then
+        copied=$((copied + 1))
+    else
+        rm -f "$dest.part"
+        failed=$((failed + 1))
+    fi
+done < "$LIST"
+
+sync
+summary="DONE - $copied COPIED"
+[ "$skipped" -gt 0 ] && summary="$summary, $skipped ALREADY THERE"
+[ "$failed" -gt 0 ] && summary="$summary, $failed FAILED"
+status "$summary"

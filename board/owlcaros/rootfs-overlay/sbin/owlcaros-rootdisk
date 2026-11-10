@@ -1,0 +1,32 @@
+#!/bin/sh
+# Print the kernel name of the disk OwlCarOS booted from (sda, nvme0n1, vda).
+# The result is cached because mdev calls this for every USB partition.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+CACHE=/run/owlcaros-rootdisk
+
+if [ -s "$CACHE" ]; then
+    cat "$CACHE"
+    exit 0
+fi
+
+part=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        root=PARTUUID=*)
+            want=$(printf '%s' "${arg#root=PARTUUID=}" | tr 'A-F' 'a-f')
+            part=$(lsblk -nrpo NAME,PARTUUID 2>/dev/null \
+                | awk -v w="$want" 'tolower($2) == w { print $1; exit }')
+            ;;
+        root=/dev/*)
+            part=${arg#root=}
+            ;;
+    esac
+done
+[ -b "$part" ] || exit 1
+
+disk=$(lsblk -nro PKNAME "$part" 2>/dev/null | sed -n '1p')
+[ -n "$disk" ] || exit 1
+
+mkdir -p /run
+printf '%s\n' "$disk" > "$CACHE"
+printf '%s\n' "$disk"

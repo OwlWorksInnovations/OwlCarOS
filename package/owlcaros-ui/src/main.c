@@ -20,6 +20,7 @@
 #include <linux/kd.h>
 #include <signal.h>
 #include <SDL.h>
+#include <SDL_ttf.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,7 +36,9 @@
 #include <unistd.h>
 
 #define MAX_INPUTS      16
-#define MAX_TRACKS      64
+#define MAX_ENTRIES     400
+#define MAX_PLAYLIST    400
+#define BT_TEXT         160
 #define TRACK_PATH      512
 #define TRACK_NAME      96
 #define BT_A2DP_PIDFILE "/var/run/bluealsa-aplay.pid"
@@ -111,58 +114,40 @@ static const uint8_t font5x7[96][7] = {
     ['|' - 32] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
 };
 
-/*
- * 16x16 dot-matrix pictograms, one bit per LED.
- *
- * Media is a compact cassette (two reels and a label strip). Navigation
- * is a heading arrow inside a bezel, like a cluster gauge. Phone is a
- * handset with a screen and keypad, settings is a cog. Everything is
- * drawn from lit dots so the tiles match the red LED matrix of the TT
- * cluster.
- */
-static const uint16_t icon_media[16] = {
-    0x0000, 0x0000, 0x0000, 0x7ffe, 0x4002, 0x5e7a, 0x565a, 0x5e7a,
-    0x4002, 0x4ff2, 0x4ff2, 0x4002, 0x7ffe, 0x0000, 0x0000, 0x0000,
-};
-
-static const uint16_t icon_navigation[16] = {
-    0x0000, 0x0000, 0x07e0, 0x1838, 0x301c, 0x6186, 0x63c6, 0xc7e3,
-    0xcff3, 0x67e6, 0x63c6, 0x318c, 0x1818, 0x07e0, 0x0000, 0x0000,
-};
-
-static const uint16_t icon_phone[16] = {
-    0x0000, 0x0000, 0x0000, 0x0ff8, 0x0808, 0x0be8, 0x0be8, 0x0808,
-    0x0aa8, 0x0808, 0x0aa8, 0x0808, 0x0ff8, 0x0000, 0x0000, 0x0000,
-};
-
-static const uint16_t icon_settings[16] = {
-    0x0000, 0x0000, 0x0000, 0x0c30, 0x0c30, 0x3ffc, 0x7ffe, 0x6c36,
-    0x6c36, 0x7ffe, 0x3ffc, 0x0c30, 0x0c30, 0x0000, 0x0000, 0x0000,
-};
-
 struct fb {
     SDL_Window *window;
     SDL_Renderer *renderer;
-    SDL_Texture *texture;
     unsigned xres;
     unsigned yres;
-    unsigned line_len;
-    unsigned bytes_pp;
-    uint8_t *back;
 };
 
-struct track {
+#define ENT_BT      0   /* the Bluetooth audio source */
+#define ENT_DIR     1   /* a folder that can be opened */
+#define ENT_FILE    2   /* a playable WAV/MP3 file */
+#define ENT_IMPORT  3   /* "copy USB music to the library" action */
+
+/* One row of the media browser. */
+struct entry {
     char path[TRACK_PATH];
     char name[TRACK_NAME];
-    double duration;
+    int type;
 };
 
 struct media {
-    struct track tracks[MAX_TRACKS];
-    int track_count;
-    int selected;        /* 0 = Bluetooth entry, 1..n = local tracks */
+    /* Browser: what the list shows right now. */
+    struct entry entries[MAX_ENTRIES];
+    int entry_count;
+    int selected;
+    char dir[TRACK_PATH];      /* "" = top level (sources) */
+
+    /* Playlist: the audio files of the folder playback started in. */
+    char playlist[MAX_PLAYLIST][TRACK_PATH];
+    int play_count;
+    int play_index;            /* -1 when nothing local is loaded */
+    char play_name[TRACK_NAME];
+    double play_duration;
+
     int source;          /* SRC_NONE / SRC_LOCAL / SRC_BT */
-    int local_index;     /* 0-based index when source == SRC_LOCAL */
     int paused;
     pid_t pid;
     double started;      /* monotonic time the current play segment began */
@@ -171,9 +156,17 @@ struct media {
     char mixer[48];
     int volume;
     int muted;
-    char bt_title[TRACK_NAME];
-    char bt_artist[TRACK_NAME];
-    char bt_status[24];
+
+    /* Bluetooth state read from BlueZ over D-Bus. */
+    int bt_connected;
+    char bt_device[TRACK_NAME];   /* phone name */
+    char bt_player[160];          /* MediaPlayer1 object path, "" if none */
+    char bt_title[BT_TEXT];
+    char bt_artist[BT_TEXT];
+    char bt_album[BT_TEXT];
+    char bt_status[24];           /* playing / paused / stopped ... */
+
+    char import_status[64];       /* last line from the USB import job */
 };
 
 struct proc_row {
@@ -202,12 +195,18 @@ struct ui {
     int system_selected;
     int system_page; /* 0=menu, 1=monitor, 2=confirm */
     int system_action; /* 1=reboot, 2=shutdown */
+    int confirm_selected; /* 0=cancel, 1=do it */
     struct sys_info system;
     char status[64];
     struct media media;
 };
 
 static volatile sig_atomic_t g_running = 1;
+static TTF_Font *g_fonts[4];
+static int g_ttf_ready;
+static double g_next_bt_refresh; /* when to poll BlueZ again */
+static const char *const font_path =
+    "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf";
 
 static void on_signal(int sig)
 {
@@ -237,40 +236,25 @@ static double mono_now(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static uint32_t color_pack(const struct fb *fb, uint32_t rgb)
+static void set_draw_color(struct fb *fb, uint32_t color)
 {
-    (void)fb;
-    return 0xff000000u | (rgb & 0x00ffffffu);
+    SDL_SetRenderDrawColor(fb->renderer, (Uint8)(color >> 16),
+                           (Uint8)(color >> 8), (Uint8)color, 255);
 }
 
-static void fill_rect(struct fb *fb, int x, int y, int w, int h, uint32_t color)
+static void fill_rect(struct fb *fb, int x, int y, int w, int h,
+                      uint32_t color)
 {
-    if (w <= 0 || h <= 0)
-        return;
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x + w > (int)fb->xres)
-        w = (int)fb->xres - x;
-    if (y + h > (int)fb->yres)
-        h = (int)fb->yres - y;
-    if (w <= 0 || h <= 0)
-        return;
+    SDL_Rect rect;
 
-    for (int yy = y; yy < y + h; yy++) {
-        uint8_t *p = fb->back + (size_t)yy * fb->line_len
-                     + (size_t)x * fb->bytes_pp;
-        for (int xx = 0; xx < w; xx++) {
-            for (unsigned i = 0; i < fb->bytes_pp; i++)
-                p[i] = (uint8_t)(color >> (8 * i));
-            p += fb->bytes_pp;
-        }
-    }
+    if (w <= 0 || h <= 0)
+        return;
+    rect.x = x;
+    rect.y = y;
+    rect.w = w;
+    rect.h = h;
+    set_draw_color(fb, color);
+    SDL_RenderFillRect(fb->renderer, &rect);
 }
 
 static void draw_char(struct fb *fb, int x, int y, char ch, int scale,
@@ -294,22 +278,64 @@ static void draw_char(struct fb *fb, int x, int y, char ch, int scale,
     }
 }
 
+static TTF_Font *font_for_scale(int scale)
+{
+    return g_fonts[iclamp(scale, 1, 3)];
+}
+
+static int font_height(int scale)
+{
+    TTF_Font *font = font_for_scale(scale);
+
+    return font != NULL ? TTF_FontHeight(font) : 7 * scale;
+}
+
 static void draw_text(struct fb *fb, int x, int y, const char *text, int scale,
                       uint32_t color)
 {
-    int cx = x;
+    TTF_Font *font = font_for_scale(scale);
+    SDL_Color foreground = {
+        (Uint8)(color >> 16), (Uint8)(color >> 8), (Uint8)color, 255
+    };
+    SDL_Surface *surface;
+    SDL_Texture *texture;
+    SDL_Rect dst;
 
-    for (; *text; text++) {
-        draw_char(fb, cx, y, *text, scale, color);
-        cx += 6 * scale;
+    if (text == NULL || text[0] == '\0')
+        return;
+    if (font == NULL) {
+        int cx = x;
+        for (; *text; text++) {
+            draw_char(fb, cx, y, *text, scale, color);
+            cx += 6 * scale;
+        }
+        return;
     }
+
+    surface = TTF_RenderUTF8_Blended(font, text, foreground);
+    if (surface == NULL)
+        return;
+    texture = SDL_CreateTextureFromSurface(fb->renderer, surface);
+    if (texture != NULL) {
+        dst.x = x;
+        dst.y = y;
+        dst.w = surface->w;
+        dst.h = surface->h;
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_RenderCopy(fb->renderer, texture, NULL, &dst);
+        SDL_DestroyTexture(texture);
+    }
+    SDL_FreeSurface(surface);
 }
 
 static int text_width(const char *text, int scale)
 {
-    int n = (int)strlen(text);
+    TTF_Font *font = font_for_scale(scale);
+    int width = 0;
 
-    return n > 0 ? (n * 6 - 1) * scale : 0;
+    if (font != NULL && TTF_SizeUTF8(font, text, &width, NULL) == 0)
+        return width;
+    return (int)strlen(text) > 0 ? ((int)strlen(text) * 6 - 1) * scale : 0;
 }
 
 static void draw_text_centered(struct fb *fb, int x, int y, int w,
@@ -321,68 +347,80 @@ static void draw_text_centered(struct fb *fb, int x, int y, int w,
 static void draw_text_ellipsis(struct fb *fb, int x, int y, int maxw,
                                const char *text, int scale, uint32_t color)
 {
-    int maxchars = maxw / (6 * scale);
-    char buf[TRACK_NAME];
+    char buf[512];
+    size_t len;
 
-    if (maxchars < 4) {
-        draw_text(fb, x, y, "", scale, color);
+    snprintf(buf, sizeof(buf) - 4, "%s", text);
+    if (text_width(buf, scale) <= maxw) {
+        draw_text(fb, x, y, buf, scale, color);
         return;
     }
 
-    snprintf(buf, sizeof(buf), "%s", text);
-    if ((int)strlen(buf) > maxchars) {
-        buf[maxchars - 2] = '\0';
-        strncat(buf, "..", sizeof(buf) - strlen(buf) - 1);
+    /* Drop whole UTF-8 characters from the end until "text..." fits. */
+    len = strlen(buf);
+    while (len > 0) {
+        len--;
+        while (len > 0 && ((unsigned char)buf[len] & 0xC0) == 0x80)
+            len--;
+        while (len > 0 && buf[len - 1] == ' ')
+            len--;
+        memcpy(buf + len, "...", 4);
+        if (text_width(buf, scale) <= maxw)
+            break;
     }
-    draw_text(fb, x, y, buf, scale, color);
-}
-
-/*
- * Draw a pictogram as a grid of glowing LED dots. The full cell is
- * painted with the dim glow colour and a smaller inset cell with the
- * bright colour, leaving a one-pixel gap that reads as a dot matrix.
- */
-static void draw_icon(struct fb *fb, int x, int y, int dot,
-                      const uint16_t *rows, uint32_t on, uint32_t glow)
-{
-    for (int r = 0; r < 16; r++) {
-        uint16_t bits = rows[r];
-
-        for (int c = 0; c < 16; c++) {
-            if (!(bits & (1u << (15 - c))))
-                continue;
-            fill_rect(fb, x + c * dot, y + r * dot, dot, dot, glow);
-            if (dot > 2)
-                fill_rect(fb, x + c * dot + 1, y + r * dot + 1,
-                          dot - 2, dot - 2, on);
-            else
-                fill_rect(fb, x + c * dot, y + r * dot, dot, dot, on);
-        }
-    }
+    if (len > 0)
+        draw_text(fb, x, y, buf, scale, color);
 }
 
 static void fb_present(struct fb *fb)
 {
-    SDL_UpdateTexture(fb->texture, NULL, fb->back, (int)fb->line_len);
-    SDL_SetRenderDrawColor(fb->renderer, 0, 0, 0, 255);
-    SDL_RenderClear(fb->renderer);
-    SDL_RenderCopy(fb->renderer, fb->texture, NULL, NULL);
     SDL_RenderPresent(fb->renderer);
+}
+
+static void close_fonts(void)
+{
+    for (int i = 1; i <= 3; i++) {
+        if (g_fonts[i] != NULL) {
+            TTF_CloseFont(g_fonts[i]);
+            g_fonts[i] = NULL;
+        }
+    }
+    if (g_ttf_ready) {
+        TTF_Quit();
+        g_ttf_ready = 0;
+    }
 }
 
 static int fb_init(struct fb *fb)
 {
+    static const int font_sizes[4] = { 0, 13, 18, 26 };
     SDL_DisplayMode mode;
+    SDL_RendererInfo renderer_info;
     int width = 1024;
     int height = 600;
-    int window_width;
-    int window_height;
 
     memset(fb, 0, sizeof(*fb));
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
         fprintf(stderr, "owlcaros-ui: SDL_Init: %s\n", SDL_GetError());
         return -1;
+    }
+    if (TTF_Init() < 0) {
+        fprintf(stderr, "owlcaros-ui: TTF_Init: %s\n", TTF_GetError());
+        SDL_Quit();
+        return -1;
+    }
+    g_ttf_ready = 1;
+    for (int i = 1; i <= 3; i++) {
+        g_fonts[i] = TTF_OpenFont(font_path, font_sizes[i]);
+        if (g_fonts[i] == NULL) {
+            fprintf(stderr, "owlcaros-ui: open font %s: %s\n",
+                    font_path, TTF_GetError());
+            close_fonts();
+            SDL_Quit();
+            return -1;
+        }
+        TTF_SetFontHinting(g_fonts[i], TTF_HINTING_NORMAL);
     }
 
     if (SDL_GetCurrentDisplayMode(0, &mode) == 0) {
@@ -398,62 +436,45 @@ static int fb_init(struct fb *fb)
         goto fail;
     }
 
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
     fb->renderer = SDL_CreateRenderer(fb->window, -1,
                                       SDL_RENDERER_ACCELERATED
                                       | SDL_RENDERER_PRESENTVSYNC);
-    if (fb->renderer == NULL)
-        fb->renderer = SDL_CreateRenderer(fb->window, -1,
-                                          SDL_RENDERER_SOFTWARE);
     if (fb->renderer == NULL) {
-        fprintf(stderr, "owlcaros-ui: SDL_CreateRenderer: %s\n",
+        fprintf(stderr, "owlcaros-ui: accelerated SDL renderer: %s\n",
                 SDL_GetError());
         goto fail;
     }
-
-    SDL_GetWindowSize(fb->window, &window_width, &window_height);
-    fb->xres = (unsigned)window_width;
-    fb->yres = (unsigned)window_height;
-    fb->bytes_pp = 4;
-    fb->line_len = fb->xres * fb->bytes_pp;
-    fb->back = calloc(fb->yres, fb->line_len);
-    if (fb->back == NULL) {
-        perror("owlcaros-ui: allocate SDL back buffer");
+    if (SDL_GetRendererInfo(fb->renderer, &renderer_info) < 0
+        || !(renderer_info.flags & SDL_RENDERER_ACCELERATED)) {
+        fprintf(stderr, "owlcaros-ui: SDL did not provide a GPU renderer\n");
         goto fail;
     }
 
-    fb->texture = SDL_CreateTexture(fb->renderer, SDL_PIXELFORMAT_ARGB8888,
-                                    SDL_TEXTUREACCESS_STREAMING,
-                                    (int)fb->xres, (int)fb->yres);
-    if (fb->texture == NULL) {
-        fprintf(stderr, "owlcaros-ui: SDL_CreateTexture: %s\n",
-                SDL_GetError());
-        goto fail;
-    }
-    SDL_SetTextureBlendMode(fb->texture, SDL_BLENDMODE_NONE);
+    SDL_GetWindowSize(fb->window, &width, &height);
+    fb->xres = (unsigned)width;
+    fb->yres = (unsigned)height;
+    fprintf(stderr, "owlcaros-ui: GPU renderer %s at %ux%u\n",
+            renderer_info.name, fb->xres, fb->yres);
     return 0;
 
 fail:
-    free(fb->back);
-    fb->back = NULL;
-    if (fb->texture != NULL)
-        SDL_DestroyTexture(fb->texture);
     if (fb->renderer != NULL)
         SDL_DestroyRenderer(fb->renderer);
     if (fb->window != NULL)
         SDL_DestroyWindow(fb->window);
+    close_fonts();
     SDL_Quit();
     return -1;
 }
 
 static void fb_close(struct fb *fb)
 {
-    if (fb->texture != NULL)
-        SDL_DestroyTexture(fb->texture);
     if (fb->renderer != NULL)
         SDL_DestroyRenderer(fb->renderer);
     if (fb->window != NULL)
         SDL_DestroyWindow(fb->window);
-    free(fb->back);
+    close_fonts();
     SDL_Quit();
 }
 
@@ -558,53 +579,194 @@ static int bt_adapter_present(void)
     return access("/sys/class/bluetooth/hci0", F_OK) == 0;
 }
 
-static void bt_control(const char *action)
+/*
+ * Bluetooth metadata and remote control.
+ *
+ * BlueZ exposes the phone's AVRCP player as an org.bluez.MediaPlayer1
+ * object. We read every BlueZ object with one ObjectManager call through
+ * dbus-send and pick out the connected phone and its player. The same
+ * player object takes Play/Pause/Next/Previous method calls.
+ */
+struct bt_player_tmp {
+    char path[160];
+    char title[BT_TEXT];
+    char artist[BT_TEXT];
+    char album[BT_TEXT];
+    char status[24];
+};
+
+static void bt_commit_player(struct media *m, const struct bt_player_tmp *t,
+                             int *have)
 {
-    run_cmd("bluetoothctl player %s >/dev/null 2>&1", action);
+    if (t->path[0] == '\0')
+        return;
+    /* Prefer a player that is actually playing over an idle one. */
+    if (*have && strcasecmp(t->status, "playing") != 0)
+        return;
+    snprintf(m->bt_player, sizeof(m->bt_player), "%s", t->path);
+    snprintf(m->bt_title, sizeof(m->bt_title), "%s", t->title);
+    snprintf(m->bt_artist, sizeof(m->bt_artist), "%s", t->artist);
+    snprintf(m->bt_album, sizeof(m->bt_album), "%s", t->album);
+    snprintf(m->bt_status, sizeof(m->bt_status), "%s", t->status);
+    *have = 1;
+}
+
+/* Copy the text between the first quote in s and the last quote. */
+static void quoted_value(const char *s, char *out, size_t n)
+{
+    const char *a = strchr(s, '"');
+    const char *b = a ? strrchr(a + 1, '"') : NULL;
+    size_t len;
+
+    out[0] = '\0';
+    if (a == NULL || b == NULL)
+        return;
+    len = (size_t)(b - a - 1);
+    if (len >= n)
+        len = n - 1;
+    memcpy(out, a + 1, len);
+    out[len] = '\0';
+}
+
+/* Parse "dbus-send --print-reply" output of GetManagedObjects. */
+static void bt_parse(FILE *p, struct media *m)
+{
+    enum { IF_OTHER, IF_PLAYER, IF_DEVICE } iface = IF_OTHER;
+    struct bt_player_tmp pl;
+    char line[512];
+    char object[160] = "";
+    char key[48] = "";
+    char dev_name[TRACK_NAME] = "";
+    int dev_connected = 0;
+    int have_player = 0;
+
+    memset(&pl, 0, sizeof(pl));
+    m->bt_connected = 0;
+    m->bt_device[0] = '\0';
+    m->bt_player[0] = '\0';
+    m->bt_title[0] = '\0';
+    m->bt_artist[0] = '\0';
+    m->bt_album[0] = '\0';
+    m->bt_status[0] = '\0';
+
+    while (fgets(line, sizeof(line), p) != NULL) {
+        const char *s = line;
+        int new_object;
+        int new_iface = 0;
+        char value[BT_TEXT];
+
+        while (*s == ' ' || *s == '\t')
+            s++;
+
+        new_object = strncmp(s, "object path \"", 13) == 0;
+        if (strncmp(s, "string \"", 8) == 0) {
+            quoted_value(s, value, sizeof(value));
+            if (strncmp(value, "org.", 4) == 0)
+                new_iface = 1;
+            else
+                snprintf(key, sizeof(key), "%.47s", value);
+        }
+
+        if (new_object || new_iface) {
+            /* Leaving the previous interface block: store what it held. */
+            if (iface == IF_PLAYER)
+                bt_commit_player(m, &pl, &have_player);
+            if (iface == IF_DEVICE && dev_connected && !m->bt_connected) {
+                m->bt_connected = 1;
+                snprintf(m->bt_device, sizeof(m->bt_device), "%s", dev_name);
+            }
+            memset(&pl, 0, sizeof(pl));
+            dev_name[0] = '\0';
+            dev_connected = 0;
+            key[0] = '\0';
+            iface = IF_OTHER;
+        }
+        if (new_object) {
+            quoted_value(s, object, sizeof(object));
+            continue;
+        }
+        if (new_iface) {
+            if (strcmp(value, "org.bluez.MediaPlayer1") == 0) {
+                iface = IF_PLAYER;
+                snprintf(pl.path, sizeof(pl.path), "%s", object);
+            } else if (strcmp(value, "org.bluez.Device1") == 0) {
+                iface = IF_DEVICE;
+            }
+            continue;
+        }
+
+        if (strncmp(s, "variant", 7) != 0 || iface == IF_OTHER)
+            continue;
+
+        if (iface == IF_DEVICE) {
+            if (strcmp(key, "Connected") == 0)
+                dev_connected = strstr(s, "boolean true") != NULL;
+            else if (strcmp(key, "Alias") == 0 && strstr(s, "string \""))
+                quoted_value(strstr(s, "string \""), dev_name,
+                             sizeof(dev_name));
+            continue;
+        }
+
+        if (strstr(s, "string \"") == NULL)
+            continue;
+        quoted_value(strstr(s, "string \""), value, sizeof(value));
+        if (strcmp(key, "Status") == 0)
+            snprintf(pl.status, sizeof(pl.status), "%.23s", value);
+        else if (strcmp(key, "Title") == 0)
+            snprintf(pl.title, sizeof(pl.title), "%s", value);
+        else if (strcmp(key, "Artist") == 0)
+            snprintf(pl.artist, sizeof(pl.artist), "%s", value);
+        else if (strcmp(key, "Album") == 0)
+            snprintf(pl.album, sizeof(pl.album), "%s", value);
+    }
+
+    if (iface == IF_PLAYER)
+        bt_commit_player(m, &pl, &have_player);
+    if (iface == IF_DEVICE && dev_connected && !m->bt_connected) {
+        m->bt_connected = 1;
+        snprintf(m->bt_device, sizeof(m->bt_device), "%s", dev_name);
+    }
 }
 
 static void bt_metadata_refresh(struct media *m)
 {
-    FILE *p = popen("bluetoothctl player show 2>/dev/null", "r");
-    char line[256];
-    int has_track = 0;
+    FILE *p;
 
-    if (p == NULL)
-        return;
-
-    while (fgets(line, sizeof(line), p) != NULL) {
-        char *value = NULL;
-        char *end;
-
-        if ((value = strstr(line, "Track.Title: ")) != NULL) {
-            value += strlen("Track.Title: ");
-            has_track = 1;
-            end = strpbrk(value, "\r\n");
-            if (end) *end = '\0';
-            if (strcmp(m->bt_title, value) != 0) {
-                snprintf(m->bt_title, sizeof(m->bt_title), "%s", value);
-            }
-        } else if ((value = strstr(line, "Track.Artist: ")) != NULL) {
-            value += strlen("Track.Artist: ");
-            end = strpbrk(value, "\r\n");
-            if (end) *end = '\0';
-            if (strcmp(m->bt_artist, value) != 0) {
-                snprintf(m->bt_artist, sizeof(m->bt_artist), "%s", value);
-            }
-        } else if ((value = strstr(line, "Status: ")) != NULL) {
-            value += strlen("Status: ");
-            end = strpbrk(value, "\r\n");
-            if (end) *end = '\0';
-            if (strcmp(m->bt_status, value) != 0) {
-                snprintf(m->bt_status, sizeof(m->bt_status), "%s", value);
-            }
-        }
-    }
-    pclose(p);
-    if (!has_track) {
+    if (!bt_adapter_present()) {
+        m->bt_connected = 0;
+        m->bt_player[0] = '\0';
         m->bt_title[0] = '\0';
         m->bt_artist[0] = '\0';
+        m->bt_album[0] = '\0';
+        m->bt_status[0] = '\0';
+        return;
     }
+
+    p = popen("dbus-send --system --print-reply --reply-timeout=1500 "
+              "--dest=org.bluez / "
+              "org.freedesktop.DBus.ObjectManager.GetManagedObjects "
+              "2>/dev/null", "r");
+    if (p == NULL)
+        return;
+    bt_parse(p, m);
+    pclose(p);
+}
+
+/* Send Play, Pause, Next or Previous to the phone. Returns 0 if it has
+ * no remote-controllable player. */
+static int bt_control(const struct media *m, const char *method)
+{
+    if (m->bt_player[0] == '\0')
+        return 0;
+    run_cmd("dbus-send --system --type=method_call --dest=org.bluez "
+            "'%s' org.bluez.MediaPlayer1.%s >/dev/null 2>&1",
+            m->bt_player, method);
+    return 1;
+}
+
+static int bt_is_playing(const struct media *m)
+{
+    return strcasecmp(m->bt_status, "playing") == 0;
 }
 
 static int alsa_playback_running(void)
@@ -833,58 +995,143 @@ static int is_audio_file(const char *path)
     return has_ext(path, ".wav") || has_ext(path, ".mp3");
 }
 
-static void add_track(struct media *m, const char *path)
+/*
+ * Media browser.
+ *
+ * The top level lists the sources: Bluetooth, the music library, every
+ * mounted USB drive and the built-in sounds. Opening a source or folder
+ * lists its sub-folders first and its audio files after them.
+ */
+#define LIBRARY_DIR  "/root/Music"
+#define BUILTIN_DIR  "/usr/share/owlcaros/media"
+#define USB_ROOT     "/run/media"
+#define IMPORT_TOOL   "/sbin/owlcaros-music-import"
+#define IMPORT_STATUS "/run/owlcaros-import.status"
+#define IMPORT_LOCK   "/run/owlcaros-import.lock"
+
+static int skip_name(const char *name)
 {
-    const char *base = strrchr(path, '/');
-    struct track *t;
-    size_t len;
-    char *dot;
-
-    if (m->track_count >= MAX_TRACKS)
-        return;
-    for (int i = 0; i < m->track_count; i++) {
-        if (strcmp(m->tracks[i].path, path) == 0)
-            return;
-    }
-
-    base = base ? base + 1 : path;
-    t = &m->tracks[m->track_count];
-    snprintf(t->path, sizeof(t->path), "%s", path);
-
-    len = strlen(base);
-    if (len >= sizeof(t->name))
-        len = sizeof(t->name) - 1;
-    for (size_t i = 0; i < len; i++) {
-        char c = base[i];
-
-        if (c == '_' || c == '-')
-            c = ' ';
-        t->name[i] = c;
-    }
-    t->name[len] = '\0';
-
-    dot = strrchr(t->name, '.');
-    if (dot != NULL)
-        *dot = '\0';
-
-    t->duration = has_ext(path, ".wav") ? wav_duration(path) : 0;
-    m->track_count++;
+    return name[0] == '.'
+        || name[0] == '$'
+        || strcasecmp(name, "System Volume Information") == 0
+        || strcasecmp(name, "lost+found") == 0
+        || strcasecmp(name, "LOST.DIR") == 0;
 }
 
-static void scan_dir(struct media *m, const char *dir, int depth)
+/* Display name: the file name without extension, underscores as spaces. */
+static void pretty_name(char *out, size_t n, const char *path, int is_file)
+{
+    const char *base = strrchr(path, '/');
+    char *dot;
+
+    base = base ? base + 1 : path;
+    snprintf(out, n, "%s", base);
+    for (char *c = out; *c; c++) {
+        if (*c == '_')
+            *c = ' ';
+    }
+    if (is_file) {
+        dot = strrchr(out, '.');
+        if (dot != NULL && dot != out)
+            *dot = '\0';
+    }
+}
+
+static void add_entry(struct media *m, int type, const char *path,
+                      const char *name)
+{
+    struct entry *e;
+
+    if (m->entry_count >= MAX_ENTRIES)
+        return;
+    e = &m->entries[m->entry_count++];
+    e->type = type;
+    snprintf(e->path, sizeof(e->path), "%s", path);
+    snprintf(e->name, sizeof(e->name), "%s", name);
+}
+
+static int dir_has_entries(const char *path)
+{
+    DIR *d = opendir(path);
+    struct dirent *e;
+    int found = 0;
+
+    if (d == NULL)
+        return 0;
+    while ((e = readdir(d)) != NULL) {
+        if (!skip_name(e->d_name)) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static int entry_cmp(const void *a, const void *b)
+{
+    const struct entry *ea = a;
+    const struct entry *eb = b;
+
+    if (ea->type != eb->type)
+        return ea->type - eb->type;
+    return strcasecmp(ea->name, eb->name);
+}
+
+static void list_top(struct media *m)
+{
+    DIR *d;
+    struct dirent *e;
+    int first_usb;
+    int usb = 0;
+
+    add_entry(m, ENT_BT, "", "BLUETOOTH AUDIO");
+    add_entry(m, ENT_DIR, LIBRARY_DIR, "MUSIC LIBRARY");
+
+    first_usb = m->entry_count;
+    d = opendir(USB_ROOT);
+    if (d != NULL) {
+        while ((e = readdir(d)) != NULL) {
+            char path[TRACK_PATH];
+            char name[TRACK_NAME];
+            struct stat st;
+
+            if (skip_name(e->d_name))
+                continue;
+            snprintf(path, sizeof(path), "%s/%s", USB_ROOT, e->d_name);
+            if (stat(path, &st) < 0 || !S_ISDIR(st.st_mode))
+                continue;
+            snprintf(name, sizeof(name), "USB DRIVE (%.60s)", e->d_name);
+            add_entry(m, ENT_DIR, path, name);
+            usb++;
+        }
+        closedir(d);
+    }
+    if (usb > 1)
+        qsort(&m->entries[first_usb], (size_t)usb, sizeof(m->entries[0]),
+              entry_cmp);
+    if (usb > 0 && access(IMPORT_TOOL, X_OK) == 0)
+        add_entry(m, ENT_IMPORT, "", "COPY USB MUSIC TO LIBRARY");
+
+    if (dir_has_entries(BUILTIN_DIR))
+        add_entry(m, ENT_DIR, BUILTIN_DIR, "BUILT-IN SOUNDS");
+}
+
+static int list_dir(struct media *m, const char *dir)
 {
     DIR *d = opendir(dir);
     struct dirent *e;
 
     if (d == NULL)
-        return;
+        return 0;
 
     while ((e = readdir(d)) != NULL) {
         char path[TRACK_PATH];
+        char name[TRACK_NAME];
         struct stat st;
         int n;
 
-        if (e->d_name[0] == '.')
+        if (skip_name(e->d_name))
             continue;
         n = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         if (n < 0 || n >= (int)sizeof(path))
@@ -893,46 +1140,141 @@ static void scan_dir(struct media *m, const char *dir, int depth)
             continue;
 
         if (S_ISDIR(st.st_mode)) {
-            if (depth > 0)
-                scan_dir(m, path, depth - 1);
+            pretty_name(name, sizeof(name), path, 0);
+            add_entry(m, ENT_DIR, path, name);
         } else if (S_ISREG(st.st_mode) && is_audio_file(path)) {
-            add_track(m, path);
+            pretty_name(name, sizeof(name), path, 1);
+            add_entry(m, ENT_FILE, path, name);
         }
+    }
+    closedir(d);
 
-        if (m->track_count >= MAX_TRACKS)
-            break;
+    qsort(m->entries, (size_t)m->entry_count, sizeof(m->entries[0]),
+          entry_cmp);
+    return 1;
+}
+
+/* Rebuild the list for the current folder. */
+static void media_list(struct media *m)
+{
+    m->entry_count = 0;
+    if (m->dir[0] != '\0' && !list_dir(m, m->dir)) {
+        /* The folder vanished (USB drive removed): back to the sources. */
+        m->dir[0] = '\0';
+        m->selected = 0;
+    }
+    if (m->dir[0] == '\0')
+        list_top(m);
+    m->selected = iclamp(m->selected, 0, imax(m->entry_count - 1, 0));
+}
+
+static void media_select_path(struct media *m, const char *path, int type)
+{
+    for (int i = 0; i < m->entry_count; i++) {
+        if (m->entries[i].type == type
+            && strcmp(m->entries[i].path, path) == 0) {
+            m->selected = i;
+            return;
+        }
+    }
+}
+
+/* Periodic refresh that keeps the cursor on the same item. */
+static void media_rescan(struct media *m)
+{
+    char keep[TRACK_PATH] = "";
+    int type = -1;
+
+    if (m->selected >= 0 && m->selected < m->entry_count) {
+        snprintf(keep, sizeof(keep), "%s", m->entries[m->selected].path);
+        type = m->entries[m->selected].type;
+    }
+    media_list(m);
+    if (type >= 0)
+        media_select_path(m, keep, type);
+}
+
+static int is_source_root(const char *path)
+{
+    size_t n = strlen(USB_ROOT);
+
+    if (strcmp(path, LIBRARY_DIR) == 0 || strcmp(path, BUILTIN_DIR) == 0)
+        return 1;
+    return strncmp(path, USB_ROOT "/", n + 1) == 0
+        && strchr(path + n + 1, '/') == NULL;
+}
+
+static void media_open(struct media *m, const char *path)
+{
+    snprintf(m->dir, sizeof(m->dir), "%s", path);
+    m->selected = 0;
+    media_list(m);
+}
+
+/* Go up one folder. Returns 0 when already at the top level. */
+static int media_up(struct media *m)
+{
+    char old[TRACK_PATH];
+    char *slash;
+
+    if (m->dir[0] == '\0')
+        return 0;
+
+    snprintf(old, sizeof(old), "%s", m->dir);
+    slash = strrchr(m->dir, '/');
+    if (is_source_root(m->dir) || slash == NULL || slash == m->dir)
+        m->dir[0] = '\0';
+    else
+        *slash = '\0';
+
+    m->selected = 0;
+    media_list(m);
+    media_select_path(m, old, ENT_DIR);
+    return 1;
+}
+
+/* "MUSIC LIBRARY / Rock / Live" for the folder being shown. */
+static void media_location(const struct media *m, char *out, size_t n)
+{
+    const char *rest = "";
+    char label[TRACK_NAME] = "";
+    size_t len = strlen(USB_ROOT);
+    size_t used;
+
+    if (m->dir[0] == '\0') {
+        snprintf(out, n, "SOURCES");
+        return;
     }
 
-    closedir(d);
-}
+    if (strncmp(m->dir, LIBRARY_DIR, strlen(LIBRARY_DIR)) == 0) {
+        snprintf(label, sizeof(label), "MUSIC LIBRARY");
+        rest = m->dir + strlen(LIBRARY_DIR);
+    } else if (strncmp(m->dir, BUILTIN_DIR, strlen(BUILTIN_DIR)) == 0) {
+        snprintf(label, sizeof(label), "BUILT-IN SOUNDS");
+        rest = m->dir + strlen(BUILTIN_DIR);
+    } else if (strncmp(m->dir, USB_ROOT "/", len + 1) == 0) {
+        const char *dev = m->dir + len + 1;
+        const char *end = strchr(dev, '/');
+        int dev_len = end ? (int)(end - dev) : (int)strlen(dev);
 
-static int track_cmp(const void *a, const void *b)
-{
-    const struct track *ta = a;
-    const struct track *tb = b;
+        snprintf(label, sizeof(label), "USB DRIVE (%.*s)",
+                 dev_len > 60 ? 60 : dev_len, dev);
+        rest = end ? end : "";
+    } else {
+        rest = m->dir;
+    }
 
-    return strcmp(ta->name, tb->name);
-}
-
-static void media_scan(struct ui *ui)
-{
-    static const struct {
-        const char *path;
-        int depth;
-    } dirs[] = {
-        { "/media", 2 },
-        { "/run/media", 2 },
-        { "/mnt", 1 },
-        { "/root/Music", 2 },
-        { "/usr/share/owlcaros/media", 1 },
-    };
-    struct media *m = &ui->media;
-
-    m->track_count = 0;
-    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
-        scan_dir(m, dirs[i].path, dirs[i].depth);
-
-    qsort(m->tracks, (size_t)m->track_count, sizeof(m->tracks[0]), track_cmp);
+    snprintf(out, n, "%s", label);
+    used = strlen(out);
+    for (const char *c = rest; *c && used + 4 < n; c++) {
+        if (*c == '/') {
+            memcpy(out + used, " / ", 3);
+            used += 3;
+        } else {
+            out[used++] = *c == '_' ? ' ' : *c;
+        }
+    }
+    out[used] = '\0';
 }
 
 static void local_stop(struct ui *ui)
@@ -940,6 +1282,7 @@ static void local_stop(struct ui *ui)
     struct media *m = &ui->media;
 
     if (m->pid > 0) {
+        kill(m->pid, SIGCONT);
         kill(m->pid, SIGTERM);
         for (int i = 0; i < 10; i++) {
             if (waitpid(m->pid, NULL, WNOHANG) == m->pid) {
@@ -958,7 +1301,6 @@ static void local_stop(struct ui *ui)
     if (m->source == SRC_LOCAL)
         m->source = SRC_NONE;
     m->paused = 0;
-    m->local_index = -1;
 }
 
 static void bt_resume(struct ui *ui)
@@ -971,16 +1313,23 @@ static void bt_resume(struct ui *ui)
     }
 }
 
+/* Start playlist item `index`. */
 static void local_start(struct ui *ui, int index)
 {
     struct media *m = &ui->media;
+    const char *path;
     pid_t pid;
 
-    if (index < 0 || index >= m->track_count)
+    if (index < 0 || index >= m->play_count)
         return;
+    path = m->playlist[index];
 
     local_stop(ui);
 
+    /* Local audio owns the sound card: quiet the phone and release the
+     * ALSA device held by the Bluetooth player. */
+    if (bt_is_playing(m))
+        bt_control(m, "Pause");
     if (bt_aplay_running() && bt_aplay_available()) {
         bt_aplay(0);
         m->bt_was_stopped = 1;
@@ -995,11 +1344,10 @@ static void local_start(struct ui *ui, int index)
             dup2(fd, STDIN_FILENO);
             close(fd);
         }
-        if (has_ext(m->tracks[index].path, ".mp3"))
-            execlp("mpg123", "mpg123", "-q", "--",
-                   m->tracks[index].path, (char *)NULL);
+        if (has_ext(path, ".mp3"))
+            execlp("mpg123", "mpg123", "-q", "--", path, (char *)NULL);
         else
-            execlp("aplay", "aplay", "-q", m->tracks[index].path, (char *)NULL);
+            execlp("aplay", "aplay", "-q", path, (char *)NULL);
         _exit(127);
     }
 
@@ -1010,13 +1358,13 @@ static void local_start(struct ui *ui, int index)
 
     m->pid = pid;
     m->source = SRC_LOCAL;
-    m->local_index = index;
+    m->play_index = index;
     m->paused = 0;
     m->elapsed = 0;
     m->started = mono_now();
-    m->selected = index + 1;
-    snprintf(ui->status, sizeof(ui->status), "PLAYING %.40s",
-             m->tracks[index].name);
+    pretty_name(m->play_name, sizeof(m->play_name), path, 1);
+    m->play_duration = has_ext(path, ".wav") ? wav_duration(path) : 0;
+    ui->status[0] = '\0';
 }
 
 static double local_elapsed(const struct media *m)
@@ -1026,29 +1374,74 @@ static double local_elapsed(const struct media *m)
     return m->elapsed + (mono_now() - m->started);
 }
 
-static void local_toggle(struct ui *ui, int index)
+static int local_active(const struct media *m)
+{
+    return m->source == SRC_LOCAL && m->pid > 0
+        && m->play_index >= 0 && m->play_index < m->play_count;
+}
+
+static void local_pause_toggle(struct ui *ui)
 {
     struct media *m = &ui->media;
 
-    if (m->source == SRC_LOCAL && m->local_index == index && m->pid > 0) {
-        if (m->paused) {
-            kill(m->pid, SIGCONT);
-            m->paused = 0;
-            m->started = mono_now();
-            snprintf(ui->status, sizeof(ui->status), "PLAYING %.40s",
-                     m->tracks[index].name);
-        } else {
-            m->elapsed = local_elapsed(m);
-            kill(m->pid, SIGSTOP);
-            m->paused = 1;
-            snprintf(ui->status, sizeof(ui->status), "PAUSED");
-        }
+    if (!local_active(m))
+        return;
+    if (m->paused) {
+        kill(m->pid, SIGCONT);
+        m->paused = 0;
+        m->started = mono_now();
+    } else {
+        m->elapsed = local_elapsed(m);
+        kill(m->pid, SIGSTOP);
+        m->paused = 1;
+    }
+}
+
+/* Is this browser row the file that is playing right now? */
+static int entry_is_playing(const struct media *m, const struct entry *e)
+{
+    return e->type == ENT_FILE && local_active(m)
+        && strcmp(m->playlist[m->play_index], e->path) == 0;
+}
+
+/* Play a file row. The playlist becomes every audio file in its folder. */
+static void play_entry(struct ui *ui, int entry_index)
+{
+    struct media *m = &ui->media;
+    int start = 0;
+
+    if (entry_is_playing(m, &m->entries[entry_index])) {
+        local_pause_toggle(ui);
         return;
     }
 
-    if (m->source != SRC_LOCAL)
-        bt_resume(ui);
-    local_start(ui, index);
+    m->play_count = 0;
+    for (int i = 0; i < m->entry_count && m->play_count < MAX_PLAYLIST; i++) {
+        if (m->entries[i].type != ENT_FILE)
+            continue;
+        if (i == entry_index)
+            start = m->play_count;
+        snprintf(m->playlist[m->play_count], TRACK_PATH, "%s",
+                 m->entries[i].path);
+        m->play_count++;
+    }
+    local_start(ui, start);
+}
+
+static void local_skip(struct ui *ui, int dir)
+{
+    struct media *m = &ui->media;
+    int idx;
+
+    if (m->play_count == 0)
+        return;
+
+    idx = m->play_index + dir;
+    if (idx < 0)
+        idx = m->play_count - 1;
+    if (idx >= m->play_count)
+        idx = 0;
+    local_start(ui, idx);
 }
 
 static void bt_start(struct ui *ui)
@@ -1058,10 +1451,9 @@ static void bt_start(struct ui *ui)
     local_stop(ui);
     bt_resume(ui);
     m->source = SRC_BT;
-    m->selected = 0;
 
     if (!bt_aplay_available()) {
-        snprintf(ui->status, sizeof(ui->status), "BT AUDIO SERVICE MISSING");
+        snprintf(ui->status, sizeof(ui->status), "BLUETOOTH AUDIO SERVICE MISSING");
         return;
     }
     if (!bt_adapter_present()) {
@@ -1071,30 +1463,62 @@ static void bt_start(struct ui *ui)
     if (!bt_aplay_running())
         bt_aplay(1);
     bt_metadata_refresh(m);
-    if (m->bt_title[0])
-        bt_control("play");
-    snprintf(ui->status, sizeof(ui->status), "BLUETOOTH AUDIO");
+    if (m->bt_player[0] && !bt_is_playing(m))
+        bt_control(m, "Play");
+    g_next_bt_refresh = 0;
+    ui->status[0] = '\0';
 }
 
-static void local_skip(struct ui *ui, int dir)
+/*
+ * Transport controls act on whatever is playing, not on the row the
+ * cursor happens to be on: skip a Bluetooth track on the phone while
+ * Bluetooth is the source, a local file otherwise.
+ */
+static void transport_skip(struct ui *ui, int dir)
 {
     struct media *m = &ui->media;
-    int idx;
 
-    if (m->track_count == 0)
+    if (m->source == SRC_BT) {
+        if (bt_control(m, dir > 0 ? "Next" : "Previous"))
+            ui->status[0] = '\0';
+        else
+            snprintf(ui->status, sizeof(ui->status),
+                     "PHONE OFFERS NO REMOTE CONTROL");
+        g_next_bt_refresh = mono_now() + 0.6;
         return;
+    }
+    local_skip(ui, dir);
+}
 
-    if (m->source == SRC_LOCAL && m->local_index >= 0)
-        idx = m->local_index + dir;
-    else
-        idx = dir > 0 ? 0 : m->track_count - 1;
+static void transport_toggle(struct ui *ui)
+{
+    struct media *m = &ui->media;
 
-    if (idx < 0)
-        idx = m->track_count - 1;
-    if (idx >= m->track_count)
-        idx = 0;
+    if (local_active(m)) {
+        local_pause_toggle(ui);
+    } else if (m->source == SRC_BT) {
+        if (!bt_control(m, bt_is_playing(m) ? "Pause" : "Play"))
+            snprintf(ui->status, sizeof(ui->status),
+                     "PHONE OFFERS NO REMOTE CONTROL");
+        g_next_bt_refresh = mono_now() + 0.6;
+    } else if (m->bt_connected) {
+        bt_start(ui);
+    } else if (m->play_count > 0) {
+        local_start(ui, m->play_index >= 0 ? m->play_index : 0);
+    }
+}
 
-    local_start(ui, idx);
+static void transport_stop(struct ui *ui)
+{
+    struct media *m = &ui->media;
+
+    if (m->source == SRC_BT) {
+        bt_control(m, "Pause");
+        g_next_bt_refresh = mono_now() + 0.6;
+    } else {
+        local_stop(ui);
+        bt_resume(ui);
+    }
 }
 
 static void media_poll(struct ui *ui)
@@ -1115,20 +1539,40 @@ static void media_poll(struct ui *ui)
     m->paused = 0;
 
     if (m->source == SRC_LOCAL) {
-        int next = m->local_index + 1;
+        int next = m->play_index + 1;
 
         m->source = SRC_NONE;
-        m->local_index = -1;
-        if (next < m->track_count) {
+        if (next < m->play_count) {
             local_start(ui, next);
         } else {
             bt_resume(ui);
-            snprintf(ui->status, sizeof(ui->status), "END OF PLAYLIST");
+            snprintf(ui->status, sizeof(ui->status), "END OF FOLDER");
         }
     }
 }
 
+/* Copy music from every mounted USB drive into the library. The shell
+ * job runs in the background and reports through a status file. */
+static void import_start(struct ui *ui)
+{
+    struct media *m = &ui->media;
 
+    if (access(IMPORT_LOCK, F_OK) == 0)
+        return;
+    snprintf(m->import_status, sizeof(m->import_status), "STARTING");
+    run_cmd("%s >/dev/null 2>&1 &", IMPORT_TOOL);
+}
+
+static void import_refresh(struct media *m)
+{
+    FILE *f = fopen(IMPORT_STATUS, "r");
+
+    if (f == NULL)
+        return;
+    if (fgets(m->import_status, sizeof(m->import_status), f) != NULL)
+        m->import_status[strcspn(m->import_status, "\r\n")] = '\0';
+    fclose(f);
+}
 
 static int battery_percent(void)
 {
@@ -1182,17 +1626,17 @@ static int battery_percent(void)
 }
 
 static void draw_top_bar(struct fb *fb, int w, int h, uint32_t panel,
-                         uint32_t red, uint32_t red_bright)
+                         uint32_t red, uint32_t red_bright,
+                         const char *right)
 {
     int top_h = imax(h / 12, 40);
     int scale = iclamp(w / 420, 2, 3);
-    int y = (top_h - 7 * scale) / 2;
+    int y = (top_h - font_height(scale)) / 2;
     int margin = imax(w / 64, 12);
     const char *center = "OWLCAROS";
-    const char *right = "SYSTEM";
 
     fill_rect(fb, 0, 0, w, top_h, panel);
-    fill_rect(fb, 0, top_h - 2, w, 2, red);
+    fill_rect(fb, 0, top_h - 1, w, 1, red);
 
     draw_text_centered(fb, 0, y, w, center, scale, red_bright);
     draw_text(fb, w - margin - text_width(right, scale), y, right, scale, red);
@@ -1223,6 +1667,21 @@ static void draw_battery_icon(struct fb *fb, int x, int y, int scale,
     }
 }
 
+static void draw_phone_icon(struct fb *fb, int x, int y, int scale,
+                            uint32_t color)
+{
+    int w = 8 * scale;
+    int h = 14 * scale;
+    int t = scale;
+
+    fill_rect(fb, x + t, y, w - 2 * t, t, color);
+    fill_rect(fb, x, y + t, t, h - 2 * t, color);
+    fill_rect(fb, x + w - t, y + t, t, h - 2 * t, color);
+    fill_rect(fb, x + t, y + h - t, w - 2 * t, t, color);
+    fill_rect(fb, x + 2 * t, y + 2 * t, w - 4 * t, h - 5 * t, color);
+    fill_rect(fb, x + 3 * t, y + h - 2 * t, 2 * t, t, color);
+}
+
 static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
                             uint32_t panel, uint32_t red, uint32_t red_dim)
 {
@@ -1235,7 +1694,10 @@ static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
     int bottom_h = imax(h / 18, 26);
     int scale = iclamp(w / 360, 1, 2);
     int margin = imax(w / 64, 12);
-    int sy = h - bottom_h + (bottom_h - 7 * scale) / 2;
+    int text_h = font_height(scale);
+    int sy = h - bottom_h + (bottom_h - text_h) / 2;
+    int phone_w = 8 * scale;
+    int phone_h = 14 * scale;
     time_t now = time(NULL);
     struct tm tm_now;
     int percent = battery_percent();
@@ -1259,175 +1721,224 @@ static void draw_bottom_bar(struct fb *fb, const struct ui *ui, int w, int h,
         snprintf(batterybuf, sizeof(batterybuf), "--%%");
 
     fill_rect(fb, 0, h - bottom_h, w, bottom_h, panel);
-    fill_rect(fb, 0, h - bottom_h, w, 2, red);
+    fill_rect(fb, 0, h - bottom_h, w, 1, red);
 
     clock_w = text_width(clockbuf, scale);
     battery_w = text_width(batterybuf, scale);
-    group_w = clock_w + 5 * scale + icon_w + 3 * scale + battery_w;
+    group_w = clock_w + 5 * scale + icon_w + 3 * scale + battery_w
+              + 5 * scale + phone_w;
     group_x = (w - group_w) / 2;
     icon_y = h - bottom_h + (bottom_h - 8 * scale) / 2;
 
     draw_text(fb, margin, sy, left, scale, red_dim);
-    draw_text(fb, group_x, sy, clockbuf, scale,
-              red);
+    draw_text(fb, group_x, sy, clockbuf, scale, red);
     draw_battery_icon(fb, group_x + clock_w + 5 * scale, icon_y, scale,
                       percent, red_dim, red);
     draw_text(fb, group_x + clock_w + 5 * scale + icon_w + 3 * scale,
               sy, batterybuf, scale, red);
+    draw_phone_icon(fb, group_x + clock_w + 5 * scale + icon_w + 3 * scale
+                    + battery_w + 5 * scale,
+                    h - bottom_h + (bottom_h - phone_h) / 2, scale, red);
     draw_text(fb, w - margin - text_width(sound, scale), sy, sound, scale,
               red_dim);
 }
 
 
-
 static void draw_line(struct fb *fb, int x0, int y0, int x1, int y1,
                       uint32_t color)
 {
-    int dx = abs(x1 - x0);
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0);
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
+    set_draw_color(fb, color);
+    SDL_RenderDrawLine(fb->renderer, x0, y0, x1, y1);
+}
 
-    for (;;) {
-        fill_rect(fb, x0, y0, 1, 1, color);
-        if (x0 == x1 && y0 == y1)
-            break;
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
+static void draw_quadratic(struct fb *fb, int x0, int y0, int cx, int cy,
+                           int x1, int y1, uint32_t color)
+{
+    const int steps = 48;
+    int px = x0;
+    int py = y0;
+    long denom = (long)steps * steps;
+
+    for (int i = 1; i <= steps; i++) {
+        long mt = steps - i;
+        long x = mt * mt * x0 + 2L * mt * i * cx + (long)i * i * x1;
+        long y = mt * mt * y0 + 2L * mt * i * cy + (long)i * i * y1;
+        int nx = (int)(x / denom);
+        int ny = (int)(y / denom);
+
+        draw_line(fb, px, py, nx, ny, color);
+        px = nx;
+        py = ny;
+    }
+}
+
+static void draw_bracket(struct fb *fb, int base_x, int apex_x, int top_y,
+                         int anchor_y, int bottom_y, uint32_t color)
+{
+    draw_quadratic(fb, base_x, top_y, apex_x, (top_y + anchor_y) / 2,
+                   apex_x, anchor_y, color);
+    draw_quadratic(fb, apex_x, anchor_y, apex_x,
+                   (anchor_y + bottom_y) / 2, base_x, bottom_y, color);
+}
+
+static void draw_filled_circle(struct fb *fb, int cx, int cy, int radius,
+                               uint32_t color)
+{
+    for (int dy = -radius; dy <= radius; dy++) {
+        int dx = radius;
+        while (dx * dx + dy * dy > radius * radius)
+            dx--;
+        fill_rect(fb, cx - dx, cy + dy, 2 * dx + 1, 1, color);
     }
 }
 
 static void draw_radio_frame(struct fb *fb, int x, int y, int w, int h,
+                             int anchor_y, int list_x, int list_w,
                              uint32_t bright, uint32_t dim)
 {
-    int left = x + w / 4;
-    int right = x + (3 * w) / 4;
-    int cy = y + h / 2;
-    int arc_h = imax(h / 5, 24);
-    int curve = imax(w / 50, 12);
+    int top = y + 18;
+    int bottom = y + h - 18;
+    int left_base = x + w / 12;
+    int left_apex = x + w / 7 - 4;
+    int right_base = x + (11 * w) / 12;
+    int right_apex = x + (6 * w) / 7 + 4;
+    int dot_x = list_x - 8;
 
-    if (arc_h > h / 3)
-        arc_h = h / 3;
-    if (curve > 36)
-        curve = 36;
+    if (anchor_y < top + 8)
+        anchor_y = top + 8;
+    if (anchor_y > bottom - 8)
+        anchor_y = bottom - 8;
 
-    fill_rect(fb, x, y, w, 2, bright);
-    fill_rect(fb, x, y + h - 2, w, 2, dim);
-    fill_rect(fb, x, y, 2, h, dim);
-    fill_rect(fb, x + w - 2, y, 2, h, dim);
-    fill_rect(fb, x + 8, y + 8, w - 16, 1, dim);
-    fill_rect(fb, x + 8, y + h - 9, w - 16, 1, dim);
+    fill_rect(fb, x, y, w, 1, bright);
+    fill_rect(fb, x + 18, y + 5, w - 36, 1, dim);
+    fill_rect(fb, x, y + h - 1, w, 1, bright);
+    fill_rect(fb, x + 18, y + h - 6, w - 36, 1, dim);
 
-    draw_line(fb, x + 2, cy - arc_h, left + curve, cy - arc_h, dim);
-    draw_line(fb, left + curve, cy - arc_h,
-              left + curve / 2, cy - arc_h / 2, bright);
-    draw_line(fb, left + curve / 2, cy - arc_h / 2, left, cy, bright);
-    draw_line(fb, left, cy, left + curve / 2, cy + arc_h / 2, bright);
-    draw_line(fb, left + curve / 2, cy + arc_h / 2,
-              left + curve, cy + arc_h, bright);
-    draw_line(fb, left + curve, cy + arc_h, x + 2, cy + arc_h, dim);
+    draw_bracket(fb, left_base, left_apex, top, anchor_y, bottom, bright);
+    draw_bracket(fb, left_base + 13, left_apex + 13,
+                 top, anchor_y, bottom, dim);
+    draw_bracket(fb, right_base, right_apex, top, anchor_y, bottom, bright);
+    draw_bracket(fb, right_base - 13, right_apex - 13,
+                 top, anchor_y, bottom, dim);
 
-    draw_line(fb, right - curve, cy - arc_h, x + w - 2, cy - arc_h, dim);
-    draw_line(fb, right - curve, cy - arc_h,
-              right - curve / 2, cy - arc_h / 2, bright);
-    draw_line(fb, right - curve / 2, cy - arc_h / 2, right, cy, bright);
-    draw_line(fb, right, cy, right - curve / 2, cy + arc_h / 2, bright);
-    draw_line(fb, right - curve / 2, cy + arc_h / 2,
-              right - curve, cy + arc_h, bright);
-    draw_line(fb, right - curve, cy + arc_h, x + w - 2, cy + arc_h, dim);
+    draw_line(fb, x, top, left_base, top, dim);
+    draw_line(fb, right_base, top, x + w, top, dim);
+    draw_line(fb, x, bottom, left_base, bottom, dim);
+    draw_line(fb, right_base, bottom, x + w, bottom, dim);
 
-    fill_rect(fb, left - 2, cy - 2, 4, 4, bright);
-    fill_rect(fb, right - 2, cy - 2, 4, 4, bright);
+    draw_line(fb, x, anchor_y, dot_x - 6, anchor_y, dim);
+    draw_line(fb, dot_x + 6, anchor_y, list_x, anchor_y, bright);
+    draw_line(fb, list_x + list_w, anchor_y,
+              x + w, anchor_y, dim);
+    draw_filled_circle(fb, dot_x, anchor_y, 6, bright);
+}
+
+/*
+ * Shared look for every screen: the main-menu palette, the lens frame and
+ * a list whose selected row is a solid bar. Screens only decide what goes
+ * above and inside the list.
+ */
+#define C_BG       0xff100303u
+#define C_PANEL    0xff180505u
+#define C_RED      0xffF05B57u
+#define C_BRIGHT   0xffFF514Cu
+#define C_DIM      0xffA94340u
+#define C_FAINT    0xff4A1513u
+#define C_SELTEXT  0xff260706u
+
+struct layout {
+    int w, h;
+    int top_h, bottom_h;
+    int fx, fy, fw, fh;      /* lens frame */
+    int scale;               /* body text size */
+    int row_h;
+    int list_x, list_w;      /* list column inside the lens */
+};
+
+static void layout_init(const struct fb *fb, struct layout *L)
+{
+    int margin;
+
+    L->w = (int)fb->xres;
+    L->h = (int)fb->yres;
+    L->top_h = imax(L->h / 12, 40);
+    L->bottom_h = imax(L->h / 18, 26);
+    margin = imax(L->w / 64, 12);
+    L->fx = margin;
+    L->fy = L->top_h + 8;
+    L->fw = imax(L->w - 2 * margin, 1);
+    L->fh = imax(L->h - L->top_h - L->bottom_h - 18, 1);
+    L->scale = iclamp(L->w / 560, 2, 3);
+    L->row_h = font_height(L->scale) + 9;
+    L->list_w = L->fw * 72 / 100;
+    L->list_x = (L->w - L->list_w) / 2;
+}
+
+static void screen_begin(struct ui *ui, const struct layout *L,
+                         const char *name, int anchor_y)
+{
+    struct fb *fb = &ui->fb;
+
+    fill_rect(fb, 0, 0, L->w, L->h, C_BG);
+    draw_top_bar(fb, L->w, L->h, C_PANEL, C_RED, C_BRIGHT, name);
+    draw_radio_frame(fb, L->fx, L->fy, L->fw, L->fh, anchor_y,
+                     L->list_x, L->list_w, C_BRIGHT, C_DIM);
+}
+
+static void screen_end(struct ui *ui, const struct layout *L)
+{
+    draw_bottom_bar(&ui->fb, ui, L->w, L->h, C_PANEL, C_BRIGHT, C_DIM);
+}
+
+/* One list row; `tag` is optional small text at the right edge. */
+static void draw_row(struct fb *fb, const struct layout *L, int y,
+                     const char *text, const char *tag, int selected)
+{
+    int text_y = y + (L->row_h - font_height(L->scale)) / 2;
+    int tag_w = 0;
+
+    if (selected)
+        fill_rect(fb, L->list_x, y + 1, L->list_w, L->row_h - 2, C_BRIGHT);
+    if (tag != NULL && tag[0] != '\0') {
+        tag_w = text_width(tag, 1) + 18;
+        draw_text(fb, L->list_x + L->list_w - 14 - text_width(tag, 1),
+                  y + (L->row_h - font_height(1)) / 2, tag, 1,
+                  selected ? C_SELTEXT : C_DIM);
+    }
+    draw_text_ellipsis(fb, L->list_x + 14, text_y, L->list_w - 28 - tag_w,
+                       text, L->scale, selected ? C_SELTEXT : C_RED);
+}
+
+static void draw_hint(struct fb *fb, const struct layout *L, const char *text)
+{
+    draw_text_centered(fb, L->fx, L->fy + L->fh - 14 - font_height(1),
+                       L->fw, text, 1, C_DIM);
 }
 
 static void draw_home(struct ui *ui)
 {
+    static const char *const labels[4] = {
+        "MEDIA - Bluetooth and Local Audio",
+        "NAVIGATION - Maps and Routes",
+        "PHONE - Hands-Free",
+        "SETTINGS - System"
+    };
     struct fb *fb = &ui->fb;
-    const int w = (int)fb->xres;
-    const int h = (int)fb->yres;
-    const uint32_t c_bg = color_pack(fb, 0x000000);
-    const uint32_t c_panel = color_pack(fb, 0x050000);
-    const uint32_t c_panel_sel = color_pack(fb, 0x210000);
-    const uint32_t c_red = color_pack(fb, 0xB00000);
-    const uint32_t c_red_bright = color_pack(fb, 0xFF0000);
-    const uint32_t c_red_dim = color_pack(fb, 0x680000);
-    const int top_h = imax(h / 12, 40);
-    const int bottom_h = imax(h / 18, 26);
-    const int margin = imax(w / 64, 12);
-    const int frame_x = margin;
-    const int frame_y = top_h + 4;
-    const int frame_w = imax(w - 2 * margin, 1);
-    const int frame_h = imax(h - top_h - bottom_h - 10, 1);
-    const int scale = iclamp(w / 500, 2, 3);
-    const int row_h = 7 * scale + 14;
-    const int list_h = row_h * 4;
-    int curve = imax(frame_w / 50, 12);
-    int list_w;
-    int list_x;
+    struct layout L;
     int list_y;
 
-    static const char *const titles[4] = {
-        "MEDIA", "NAVIGATION", "PHONE", "SETTINGS"
-    };
-    static const char *const details[4] = {
-        "BLUETOOTH AND LOCAL AUDIO", "MAPS AND ROUTES",
-        "HANDS-FREE", "SYSTEM"
-    };
+    layout_init(fb, &L);
+    list_y = L.fy + L.fh / 2 - (L.row_h * 4) / 2;
 
-    if (curve > 36)
-        curve = 36;
-    list_w = imax(frame_w / 2 - 2 * curve, 1);
-    list_x = (w - list_w) / 2;
-    list_y = frame_y + frame_h / 2 - list_h / 2;
-
-    fill_rect(fb, 0, 0, w, h, c_bg);
-    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
-    draw_radio_frame(fb, frame_x, frame_y, frame_w, frame_h,
-                     c_red_bright, c_red_dim);
-
-    draw_text_centered(fb, list_x, list_y - 7 * scale - 13,
-                       list_w, "SELECT MODE", scale, c_red_bright);
-    fill_rect(fb, list_x, list_y - 4, list_w, 1, c_red_dim);
-
-    for (int i = 0; i < 4; i++) {
-        int y = list_y + i * row_h;
-        int selected = i == ui->selected;
-        int title_y = y + (row_h - (7 * scale + 8)) / 2;
-        int text_x = list_x + 12;
-        int text_w = list_w - 24;
-        uint32_t title_color = selected ? c_red_bright : c_red_dim;
-        uint32_t detail_color = selected ? c_red : c_red_dim;
-
-        if (selected) {
-            fill_rect(fb, list_x + 2, y + 1, list_w - 4, row_h - 2,
-                      c_panel_sel);
-            fill_rect(fb, list_x + 2, y + 1, list_w - 4, 1, c_red_bright);
-            fill_rect(fb, list_x + 2, y + row_h - 2, list_w - 4, 1,
-                      c_red_bright);
-        } else {
-            fill_rect(fb, list_x + 8, y + row_h - 1, list_w - 16, 1,
-                      c_red_dim);
-        }
-
-        draw_text_ellipsis(fb, text_x, title_y, text_w, titles[i], scale,
-                           title_color);
-        draw_text_ellipsis(fb, text_x, title_y + 7 * scale + 2,
-                           text_w, details[i], 1, detail_color);
-    }
-
-    draw_text_centered(fb, frame_x, frame_y + frame_h - 18,
-                       frame_w, "UP/DOWN SELECT   ENTER OPEN", 1, c_red_dim);
-    draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
+    screen_begin(ui, &L, "MENU",
+                 list_y + ui->selected * L.row_h + L.row_h / 2);
+    for (int i = 0; i < 4; i++)
+        draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
+                 i == ui->selected);
+    if (ui->status[0] != '\0' && strcmp(ui->status, "READY") != 0)
+        draw_hint(fb, &L, ui->status);
+    screen_end(ui, &L);
 }
-
 static void fmt_time(char *buf, size_t n, double seconds)
 {
     int s = (int)seconds;
@@ -1437,253 +1948,189 @@ static void fmt_time(char *buf, size_t n, double seconds)
     snprintf(buf, n, "%d:%02d", s / 60, s % 60);
 }
 
-static void draw_vu(struct fb *fb, int x, int y, int w, int h, int active,
-                    double t, uint32_t low, uint32_t mid, uint32_t high,
-                    uint32_t off)
+static void upper_copy(char *out, size_t n, const char *in)
 {
-    int bars = 24;
-    int gap = imax(w / 240, 2);
-    int bw = (w - (bars - 1) * gap) / bars;
-    int seg_h = 5;
-    int seg_gap = 3;
-    int segs = h / (seg_h + seg_gap);
+    size_t i = 0;
 
-    if (bw < 2) {
-        bars = 12;
-        gap = 2;
-        bw = (w - (bars - 1) * gap) / bars;
+    for (; in[i] != '\0' && i + 1 < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : (char)c;
     }
-    if (bw < 1 || segs < 1)
-        return;
-
-    for (int i = 0; i < bars; i++) {
-        int level;
-        int lit;
-
-        if (active)
-            level = 32 + (int)(((long)(t * 11.0) + i * 17 + i * i * 7) % 62);
-        else
-            level = 5;
-
-        lit = level * segs / 100;
-        if (lit < 1)
-            lit = 1;
-
-        for (int s = 0; s < lit; s++) {
-            int sy = y + h - (s + 1) * (seg_h + seg_gap);
-            uint32_t c;
-
-            if (s * 100 >= segs * 75)
-                c = high;
-            else if (s * 100 >= segs * 45)
-                c = mid;
-            else
-                c = low;
-
-            fill_rect(fb, x + i * (bw + gap), sy, bw, seg_h, c);
-        }
-
-        for (int s = lit; s < segs; s++) {
-            int sy = y + h - (s + 1) * (seg_h + seg_gap);
-
-            fill_rect(fb, x + i * (bw + gap), sy, bw, 1, off);
-        }
-    }
+    out[i] = '\0';
 }
-
 
 static void draw_media(struct ui *ui)
 {
     struct fb *fb = &ui->fb;
-    const int w = (int)fb->xres;
-    const int h = (int)fb->yres;
-    const uint32_t c_bg = color_pack(fb, 0x000000);
-    const uint32_t c_panel = color_pack(fb, 0x050000);
-    const uint32_t c_panel_sel = color_pack(fb, 0x210000);
-    const uint32_t c_red = color_pack(fb, 0xB00000);
-    const uint32_t c_red_bright = color_pack(fb, 0xFF0000);
-    const uint32_t c_red_dim = color_pack(fb, 0x680000);
-    const uint32_t c_red_faint = color_pack(fb, 0x260000);
-    const uint32_t c_glow = color_pack(fb, 0x260000);
-    const int top_h = imax(h / 12, 40);
-    const int bottom_h = imax(h / 18, 26);
-    const int margin = imax(w / 64, 12);
-    const int frame_x = margin;
-    const int frame_y = top_h + 4;
-    const int frame_w = imax(w - 2 * margin, 1);
-    const int frame_h = imax(h - top_h - bottom_h - 10, 1);
-    const int scale = iclamp(w / 500, 2, 3);
-    int curve = imax(frame_w / 50, 12);
-    int content_w;
-    int content_x;
     struct media *m = &ui->media;
-    const struct track *tr = NULL;
-    char timebuf[16];
-    char durbuf[16];
-    char line[TRACK_NAME + 16];
-    const char *state = "IDLE";
-    const char *source = "NO SOURCE";
-    const char *title = "NO SOURCE";
+    struct layout L;
+    char source[TRACK_NAME + 16] = "NO SOURCE";
+    char state[32] = "";
+    char title[BT_TEXT] = "";
+    char sub[2 * BT_TEXT + 8] = "";
+    char location[TRACK_PATH];
+    char count[32];
+    char tag[64];
     int active = 0;
     double elapsed = 0;
     double duration = 0;
-    int now_y;
-    int title_y;
-    int status_y;
-    int meter_y;
-    int list_header_y;
-    int rows_y;
-    int row_h = 7 * scale + 8;
-    int max_rows;
-    int rows;
-    int items = 1 + m->track_count;
-    int top = 0;
+    int h1, h2, h3;
+    int x, iw, y;
+    int title_y, sub_y, bar_y, head_y, list_y, rows, top;
 
-    if (curve > 36)
-        curve = 36;
-    content_w = imax(frame_w / 2 - 2 * curve, 1);
-    content_x = (w - content_w) / 2;
+    layout_init(fb, &L);
+    h1 = font_height(1);
+    h2 = font_height(L.scale);
+    h3 = font_height(3);
+    x = L.list_x + 14;
+    iw = L.list_w - 28;
 
-    fill_rect(fb, 0, 0, w, h, c_bg);
-    draw_top_bar(fb, w, h, c_panel, c_red, c_red_bright);
-    draw_radio_frame(fb, frame_x, frame_y, frame_w, frame_h,
-                     c_red_bright, c_red_dim);
-
-    if (m->source == SRC_LOCAL && m->local_index >= 0
-        && m->local_index < m->track_count) {
-        tr = &m->tracks[m->local_index];
-        title = tr->name;
-        source = "LOCAL";
-        state = m->paused ? "PAUSED" : "PLAYING";
+    /* What is playing. */
+    if (local_active(m)) {
+        snprintf(source, sizeof(source), "LOCAL MUSIC");
+        snprintf(title, sizeof(title), "%s", m->play_name);
+        snprintf(sub, sizeof(sub), "Track %d of %d", m->play_index + 1,
+                 m->play_count);
+        snprintf(state, sizeof(state), "%s", m->paused ? "PAUSED" : "PLAYING");
         elapsed = local_elapsed(m);
-        duration = tr->duration;
+        duration = m->play_duration;
         active = !m->paused;
     } else if (m->source == SRC_BT) {
-        int streaming = alsa_playback_running();
+        if (m->bt_device[0])
+            snprintf(source, sizeof(source), "BLUETOOTH - %s", m->bt_device);
+        else
+            snprintf(source, sizeof(source), "BLUETOOTH");
 
-        title = m->bt_title[0] ? m->bt_title : "BLUETOOTH AUDIO";
-        source = "A2DP";
-        state = m->bt_status[0] ? m->bt_status
-                                : (streaming ? "STREAMING" : "WAITING FOR PHONE");
-        active = streaming;
-    }
+        if (m->bt_title[0]) {
+            snprintf(title, sizeof(title), "%s", m->bt_title);
+            if (m->bt_artist[0] && m->bt_album[0])
+                snprintf(sub, sizeof(sub), "%s - %s", m->bt_artist,
+                         m->bt_album);
+            else
+                snprintf(sub, sizeof(sub), "%s",
+                         m->bt_artist[0] ? m->bt_artist : m->bt_album);
+        } else if (m->bt_connected) {
+            snprintf(title, sizeof(title), "Bluetooth Audio");
+            snprintf(sub, sizeof(sub), "Play something on your phone");
+        } else {
+            snprintf(title, sizeof(title), "Waiting for phone");
+            snprintf(sub, sizeof(sub), "Pair with OwlCarOS in Bluetooth settings");
+        }
 
-    now_y = frame_y + frame_h / 7;
-    title_y = now_y + 7 * scale + 8;
-    status_y = title_y + 7 * scale + 5;
-    meter_y = status_y + 12;
-    list_header_y = frame_y + frame_h / 2 + 8;
-    rows_y = list_header_y + 15;
-    max_rows = (frame_y + frame_h - 27 - rows_y) / row_h;
-    if (max_rows > 5)
-        max_rows = 5;
-    if (max_rows < 1)
-        max_rows = 1;
-
-    draw_text(fb, content_x + 4, now_y, "NOW PLAYING", 1, c_red_dim);
-    draw_text(fb, content_x + content_w - text_width(source, 1) - 4,
-              now_y, source, 1, c_red);
-    draw_text_centered(fb, content_x, title_y, content_w, title,
-                       scale, active ? c_red_bright : c_red);
-    if (m->source == SRC_BT && m->bt_artist[0]) {
-        draw_text_centered(fb, content_x, status_y, content_w, m->bt_artist,
-                           1, c_red);
-        draw_text_centered(fb, content_x, status_y + 8, content_w, state,
-                           1, c_red_dim);
-        meter_y += 8;
+        if (m->bt_status[0])
+            upper_copy(state, sizeof(state), m->bt_status);
+        else
+            snprintf(state, sizeof(state), "%s",
+                     alsa_playback_running() ? "STREAMING"
+                     : m->bt_connected ? "CONNECTED" : "NOT CONNECTED");
+        active = bt_is_playing(m) || alsa_playback_running();
     } else {
-        draw_text_centered(fb, content_x, status_y, content_w, state,
-                           1, c_red_dim);
+        snprintf(title, sizeof(title), "Nothing playing");
+        snprintf(sub, sizeof(sub), "Choose Bluetooth or a folder below");
     }
+    if (ui->status[0] != '\0' && strcmp(ui->status, "READY") != 0
+        && strcmp(ui->status, "MEDIA") != 0)
+        snprintf(sub, sizeof(sub), "%s", ui->status);
 
-    if (duration > 0 && m->source == SRC_LOCAL) {
-        int fraction = iclamp((int)(elapsed * 100.0 / duration), 0, 100);
-        int bar_x = content_x + 8;
-        int bar_w = content_w - 16;
+    /* Vertical layout: now-playing block on top, the list below it. */
+    y = L.fy + 26;
+    title_y = y + h1 + 6;
+    sub_y = title_y + h3 + 2;
+    bar_y = sub_y + h2 + 10;
+    head_y = bar_y + 6 + h1 + 14;
+    list_y = head_y + h1 + 8;
+    rows = (L.fy + L.fh - 22 - h1 - list_y) / L.row_h;
+    if (rows < 1)
+        rows = 1;
 
-        fill_rect(fb, bar_x, meter_y, bar_w, 2, c_red_faint);
-        fill_rect(fb, bar_x, meter_y, bar_w * fraction / 100, 2,
-                  c_red_bright);
-        fmt_time(timebuf, sizeof(timebuf), elapsed);
-        fmt_time(durbuf, sizeof(durbuf), duration);
-        draw_text(fb, bar_x, meter_y + 7, timebuf, 1, c_red_dim);
-        draw_text(fb, bar_x + bar_w - text_width(durbuf, 1),
-                  meter_y + 7, durbuf, 1, c_red_dim);
-    } else if (m->source == SRC_BT) {
-        draw_vu(fb, content_x + content_w / 4, meter_y,
-                content_w / 2, 22, active, mono_now(),
-                c_red_dim, c_red, c_red_bright, c_red_faint);
-    } else {
-        fill_rect(fb, content_x + 8, meter_y, content_w - 16, 1, c_red_dim);
-    }
-
-    draw_line(fb, content_x, list_header_y - 4,
-              content_x + content_w, list_header_y - 4, c_red_dim);
-    snprintf(line, sizeof(line), "%d TRACK%s", m->track_count,
-             m->track_count == 1 ? "" : "S");
-    draw_text(fb, content_x + 4, list_header_y, "MEMORY", 1, c_red);
-    draw_text(fb, content_x + content_w - text_width(line, 1) - 4,
-              list_header_y, line, 1, c_red_dim);
-
-    rows = max_rows;
-    if (m->selected >= rows)
-        top = m->selected - rows + 1;
-    if (top > items - rows && items > rows)
-        top = items - rows;
+    top = m->selected - rows / 2;
+    if (top > m->entry_count - rows)
+        top = m->entry_count - rows;
     if (top < 0)
         top = 0;
 
-    for (int i = 0; i < rows; i++) {
-        int item = top + i;
-        int y = rows_y + i * row_h;
-        int selected;
-        char label[TRACK_NAME + 8];
+    screen_begin(ui, &L, "MEDIA",
+                 list_y + (m->selected - top) * L.row_h + L.row_h / 2);
 
-        if (item >= items)
+    draw_text_ellipsis(fb, x, y, iw - text_width(state, 1) - 16, source, 1,
+                       C_DIM);
+    draw_text(fb, x + iw - text_width(state, 1), y, state, 1,
+              active ? C_BRIGHT : C_DIM);
+    draw_text_ellipsis(fb, x, title_y, iw, title, 3, C_BRIGHT);
+    draw_text_ellipsis(fb, x, sub_y, iw, sub, L.scale, C_RED);
+
+    fill_rect(fb, x, bar_y, iw, 4, C_FAINT);
+    if (duration > 0) {
+        char timebuf[16];
+        char durbuf[16];
+        int frac = iclamp((int)(elapsed * 1000.0 / duration), 0, 1000);
+
+        fill_rect(fb, x, bar_y, iw * frac / 1000, 4, C_BRIGHT);
+        fmt_time(timebuf, sizeof(timebuf), elapsed);
+        fmt_time(durbuf, sizeof(durbuf), duration);
+        draw_text(fb, x, bar_y + 8, timebuf, 1, C_DIM);
+        draw_text(fb, x + iw - text_width(durbuf, 1), bar_y + 8, durbuf, 1,
+                  C_DIM);
+    } else if (local_active(m)) {
+        char timebuf[16];
+
+        fmt_time(timebuf, sizeof(timebuf), elapsed);
+        draw_text(fb, x, bar_y + 8, timebuf, 1, C_DIM);
+    }
+
+    /* List header: where we are and how far down. */
+    media_location(m, location, sizeof(location));
+    if (m->entry_count > 0)
+        snprintf(count, sizeof(count), "%d / %d", m->selected + 1,
+                 m->entry_count);
+    else
+        snprintf(count, sizeof(count), "EMPTY");
+    draw_text_ellipsis(fb, x, head_y, iw - text_width(count, 1) - 16,
+                       location, 1, C_DIM);
+    draw_text(fb, x + iw - text_width(count, 1), head_y, count, 1, C_DIM);
+
+    for (int i = 0; i < rows && top + i < m->entry_count; i++) {
+        const struct entry *e = &m->entries[top + i];
+
+        tag[0] = '\0';
+        switch (e->type) {
+        case ENT_BT:
+            if (m->source == SRC_BT)
+                snprintf(tag, sizeof(tag), "%s",
+                         bt_is_playing(m) ? "PLAYING" : "SELECTED");
+            else if (m->bt_connected)
+                snprintf(tag, sizeof(tag), "PHONE CONNECTED");
             break;
-        selected = item == m->selected;
-
-        if (selected) {
-            fill_rect(fb, content_x + 2, y, content_w - 4, row_h - 1,
-                      c_panel_sel);
-            fill_rect(fb, content_x + 2, y, content_w - 4, 1,
-                      c_red_bright);
-            fill_rect(fb, content_x + 2, y + row_h - 2,
-                      content_w - 4, 1, c_red_bright);
-        } else {
-            fill_rect(fb, content_x + 10, y + row_h - 1,
-                      content_w - 20, 1, c_red_faint);
+        case ENT_DIR:
+            snprintf(tag, sizeof(tag), "FOLDER");
+            break;
+        case ENT_FILE:
+            if (entry_is_playing(m, e))
+                snprintf(tag, sizeof(tag), "%s",
+                         m->paused ? "PAUSED" : "PLAYING");
+            break;
+        case ENT_IMPORT:
+            snprintf(tag, sizeof(tag), "%s", m->import_status);
+            break;
+        default:
+            break;
         }
-
-        if (item == 0)
-            snprintf(label, sizeof(label), "BLUETOOTH AUDIO");
-        else
-            snprintf(label, sizeof(label), "%02d  %s", item,
-                     m->tracks[item - 1].name);
-
-        draw_text_ellipsis(fb, content_x + 10, y + (row_h - 7 * scale) / 2,
-                           content_w - 20, label, scale,
-                           selected ? c_red_bright : c_red_dim);
-
-        if (item == 0 && m->source == SRC_BT) {
-            const char *tag = alsa_playback_running() ? "PLAY" : "IDLE";
-
-            draw_text(fb, content_x + content_w - 10 - text_width(tag, 1),
-                      y + (row_h - 7) / 2, tag, 1, c_red);
-        }
+        draw_row(fb, &L, list_y + i * L.row_h, e->name, tag,
+                 top + i == m->selected);
     }
 
-    if (m->track_count == 0 && rows > 1) {
-        draw_text_centered(fb, content_x, rows_y + row_h, content_w,
-                           "NO LOCAL TRACKS", 1, c_red_dim);
-        draw_text_centered(fb, content_x, rows_y + row_h + 9, content_w,
-                           "ADD WAV OR MP3 TO /MEDIA", 1, c_red_dim);
+    if (m->entry_count == 0) {
+        draw_text(fb, x, list_y + 4,
+                  strncmp(m->dir, LIBRARY_DIR, strlen(LIBRARY_DIR)) == 0
+                  ? "No music here yet. Plug in a USB drive and copy it over."
+                  : "No folders or music files here.",
+                  L.scale, C_DIM);
     }
 
-    draw_text_centered(fb, frame_x, frame_y + frame_h - 18,
-                       frame_w, "UP/DOWN SELECT  ENTER PLAY  L/R SKIP  ESC BACK",
-                       1, c_red_dim);
-    draw_bottom_bar(fb, ui, w, h, c_panel, c_red, c_red_dim);
+    draw_hint(fb, &L, "ENTER OPEN / PLAY     SPACE PAUSE     LEFT / RIGHT SKIP"
+                      "     BACKSPACE UP");
+    screen_end(ui, &L);
 }
 
 static void system_info_refresh(struct sys_info *info)
@@ -1814,127 +2261,131 @@ static void system_info_refresh(struct sys_info *info)
     }
 }
 
+static void draw_meter(struct fb *fb, int x, int y, int w, int percent)
+{
+    fill_rect(fb, x, y, w, 10, C_FAINT);
+    fill_rect(fb, x, y, w * iclamp(percent, 0, 100) / 100, 10, C_BRIGHT);
+}
+
 static void draw_system(struct ui *ui)
 {
     struct fb *fb = &ui->fb;
-    const int w = (int)fb->xres, h = (int)fb->yres;
-    const uint32_t bg = color_pack(fb, 0x000000);
-    const uint32_t panel = color_pack(fb, 0x050000);
-    const uint32_t selected = color_pack(fb, 0x210000);
-    const uint32_t red = color_pack(fb, 0xB00000);
-    const uint32_t bright = color_pack(fb, 0xFF0000);
-    const uint32_t dim = color_pack(fb, 0x680000);
-    const uint32_t faint = color_pack(fb, 0x260000);
-    int top_h = imax(h / 12, 40), bottom_h = imax(h / 18, 26);
-    int margin = imax(w / 64, 12);
-    int fx = margin, fy = top_h + 4;
-    int fw = imax(w - 2 * margin, 1);
-    int fh = imax(h - top_h - bottom_h - 10, 1);
-    int scale = iclamp(w / 500, 2, 3);
+    struct layout L;
     char text[128];
+    int h2, h3;
 
-    fill_rect(fb, 0, 0, w, h, bg);
-    draw_top_bar(fb, w, h, panel, red, bright);
-    draw_radio_frame(fb, fx, fy, fw, fh, bright, dim);
+    layout_init(fb, &L);
+    h2 = font_height(L.scale);
+    h3 = font_height(3);
 
     if (ui->system_page == 0) {
-        static const char *const titles[] = { "REBOOT", "SHUTDOWN", "SYSTEM INFO" };
-        static const char *const details[] = {
-            "RESTART OWLCAROS", "POWER OFF DEVICE", "CPU, MEMORY, LOAD, PROCESSES"
+        static const char *const labels[3] = {
+            "REBOOT - Restart OwlCarOS",
+            "SHUTDOWN - Power Off",
+            "SYSTEM INFO - CPU, Memory and Processes"
         };
-        int row_h = 7 * scale + 18;
-        int list_h = row_h * 3;
-        int list_w = imax(fw / 2 - 24, 1);
-        int list_x = (w - list_w) / 2;
-        int list_y = fy + fh / 2 - list_h / 2;
+        int list_y = L.fy + L.fh / 2 - (L.row_h * 3) / 2;
 
-        draw_text_centered(fb, fx, fy + fh / 8, fw, "SYSTEM", scale, bright);
-        for (int i = 0; i < 3; i++) {
-            int y = list_y + i * row_h;
-            int ty = y + (row_h - 7 * scale - 8) / 2;
-            if (i == ui->system_selected) {
-                fill_rect(fb, list_x, y + 1, list_w, row_h - 2, selected);
-                fill_rect(fb, list_x, y + 1, list_w, 1, bright);
-                fill_rect(fb, list_x, y + row_h - 2, list_w, 1, bright);
-            } else {
-                fill_rect(fb, list_x + 8, y + row_h - 1, list_w - 16, 1, dim);
-            }
-            draw_text_centered(fb, list_x, ty, list_w, titles[i], scale,
-                               i == ui->system_selected ? bright : dim);
-            draw_text_centered(fb, list_x, ty + 7 * scale + 2, list_w,
-                               details[i], 1, red);
-        }
-        draw_text_centered(fb, fx, fy + fh - 18, fw,
-                           "UP/DOWN SELECT   ENTER OPEN   ESC BACK", 1, dim);
+        screen_begin(ui, &L, "SETTINGS",
+                     list_y + ui->system_selected * L.row_h + L.row_h / 2);
+        for (int i = 0; i < 3; i++)
+            draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
+                     i == ui->system_selected);
+        draw_hint(fb, &L, "UP / DOWN SELECT     ENTER OPEN     ESC BACK");
     } else if (ui->system_page == 2) {
-        const char *action = ui->system_action == 1 ? "REBOOT OWLCAROS?"
-                                                     : "SHUT DOWN OWLCAROS?";
-        draw_text_centered(fb, fx, fy + fh / 3, fw, action, scale, bright);
-        draw_text_centered(fb, fx, fy + fh / 2, fw,
-                           "ENTER CONFIRM   ESC CANCEL", 1, red);
-        draw_text_centered(fb, fx, fy + fh / 2 + 14, fw,
-                           "UNSAVED WORK WILL BE LOST", 1, dim);
+        const char *question = ui->system_action == 1
+                             ? "Reboot OwlCarOS?" : "Shut down OwlCarOS?";
+        const char *labels[2];
+        int list_y = L.fy + L.fh / 2 - L.row_h;
+
+        labels[0] = "CANCEL - Go Back";
+        labels[1] = ui->system_action == 1 ? "REBOOT NOW" : "SHUT DOWN NOW";
+
+        screen_begin(ui, &L, "SETTINGS",
+                     list_y + ui->confirm_selected * L.row_h + L.row_h / 2);
+        draw_text(fb, L.list_x + 14, list_y - h3 - 18, question, 3, C_BRIGHT);
+        for (int i = 0; i < 2; i++)
+            draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
+                     i == ui->confirm_selected);
+        draw_hint(fb, &L, "UP / DOWN SELECT     ENTER CONFIRM     ESC CANCEL");
     } else {
         const struct sys_info *si = &ui->system;
-        int x = fx + imax(fw / 5, 24);
-        int usable_w = fw - 2 * (x - fx);
-        int y = fy + fh / 8;
-        int bar_w = imax(usable_w - 100, 1);
-        int bar_h = 7;
-        char uptime[48];
+        int line_h = h2 + 8;
+        int x = L.list_x + 14;
+        int iw = L.list_w - 28;
+        int label_w = text_width("MEMORY  ", L.scale);
+        int value_w = text_width("100%  ", L.scale);
+        int bar_x = x + label_w + value_w;
+        int bar_w = imax(iw - label_w - value_w, 1);
+        int block_h = h3 + 14 + 4 * line_h + 12 + 6 * line_h;
+        int y = L.fy + L.fh / 2 - block_h / 2;
         unsigned long days = si->uptime_seconds / 86400;
         unsigned long hours = (si->uptime_seconds / 3600) % 24;
         unsigned long minutes = (si->uptime_seconds / 60) % 60;
 
-        snprintf(uptime, sizeof(uptime), "%lu d %02lu:%02lu", days, hours, minutes);
-        draw_text_centered(fb, fx, fy + 12, fw, "LIVE SYSTEM MONITOR", scale, bright);
+        screen_begin(ui, &L, "SETTINGS", y + h3 + 14 + line_h / 2);
 
-        snprintf(text, sizeof(text), "CPU  %3d%%", si->cpu_percent);
-        draw_text(fb, x, y, text, 1, red);
-        fill_rect(fb, x + 100, y + 2, bar_w, bar_h, faint);
-        fill_rect(fb, x + 100, y + 2, bar_w * iclamp(si->cpu_percent, 0, 100) / 100,
-                  bar_h, bright);
+        draw_text(fb, x, y, "System Info", 3, C_BRIGHT);
+        y += h3 + 14;
 
-        y += 18;
+        draw_text(fb, x, y, "CPU", L.scale, C_RED);
+        snprintf(text, sizeof(text), "%d%%", si->cpu_percent);
+        draw_text(fb, x + label_w, y, text, L.scale, C_BRIGHT);
+        draw_meter(fb, bar_x, y + (h2 - 10) / 2, bar_w, si->cpu_percent);
+        y += line_h;
+
+        draw_text(fb, x, y, "MEMORY", L.scale, C_RED);
+        snprintf(text, sizeof(text), "%d%%", si->mem_percent);
+        draw_text(fb, x + label_w, y, text, L.scale, C_BRIGHT);
+        draw_meter(fb, bar_x, y + (h2 - 10) / 2, bar_w, si->mem_percent);
+        y += line_h;
+
         if (si->mem_total_kb)
-            snprintf(text, sizeof(text), "MEM  %3d%%  %lu / %lu MB",
-                     si->mem_percent, si->mem_used_kb / 1024,
-                     si->mem_total_kb / 1024);
+            snprintf(text, sizeof(text), "%lu of %lu MB used     %d tasks",
+                     si->mem_used_kb / 1024, si->mem_total_kb / 1024,
+                     si->process_count);
         else
-            snprintf(text, sizeof(text), "MEM  UNAVAILABLE");
-        draw_text(fb, x, y, text, 1, red);
-        fill_rect(fb, x + 100, y + 9, bar_w, bar_h, faint);
-        fill_rect(fb, x + 100, y + 9,
-                  bar_w * iclamp(si->mem_percent, 0, 100) / 100, bar_h, bright);
+            snprintf(text, sizeof(text), "Memory unavailable     %d tasks",
+                     si->process_count);
+        draw_text_ellipsis(fb, x, y, iw, text, L.scale, C_DIM);
+        y += line_h;
 
-        y += 25;
-        snprintf(text, sizeof(text), "LOAD %s    UPTIME %s    TASKS %d",
-                 si->load, uptime, si->process_count);
-        draw_text_ellipsis(fb, x, y, usable_w, text, 1, dim);
+        snprintf(text, sizeof(text), "Load %s     Up %lu d %02lu:%02lu",
+                 si->load, days, hours, minutes);
+        draw_text_ellipsis(fb, x, y, iw, text, L.scale, C_DIM);
+        y += line_h;
 
-        y += 18;
-        fill_rect(fb, x, y, usable_w, 1, dim);
-        y += 7;
-        draw_text(fb, x, y, "PID     PROCESS                 RESIDENT", 1, red);
+        fill_rect(fb, x, y + 2, iw, 1, C_DIM);
         y += 12;
+        draw_text(fb, x, y, "PID", L.scale, C_RED);
+        draw_text(fb, x + iw / 6, y, "PROCESS", L.scale, C_RED);
+        draw_text(fb, x + iw - text_width("MEMORY", L.scale), y, "MEMORY",
+                  L.scale, C_RED);
+        y += line_h;
         for (int i = 0; i < 5; i++) {
-            if (i < si->top_count)
-                snprintf(text, sizeof(text), "%-6d  %-22.22s %5lu MB",
-                         si->top[i].pid, si->top[i].name,
-                         si->top[i].rss_kb / 1024);
-            else
-                snprintf(text, sizeof(text), "--      --                      --");
-            draw_text(fb, x, y + i * 11, text, 1, i == 0 ? bright : dim);
+            uint32_t color = i == 0 ? C_BRIGHT : C_DIM;
+
+            if (i >= si->top_count)
+                break;
+            snprintf(text, sizeof(text), "%d", si->top[i].pid);
+            draw_text(fb, x, y, text, L.scale, color);
+            draw_text_ellipsis(fb, x + iw / 6, y, iw / 2, si->top[i].name,
+                               L.scale, color);
+            snprintf(text, sizeof(text), "%lu MB", si->top[i].rss_kb / 1024);
+            draw_text(fb, x + iw - text_width(text, L.scale), y, text,
+                      L.scale, color);
+            y += line_h;
         }
-        draw_text_centered(fb, fx, fy + fh - 18, fw,
-                           "LIVE CPU / MEMORY / PROCESS SUMMARY   ESC BACK", 1, dim);
+        draw_hint(fb, &L, "LIVE CPU, MEMORY AND PROCESSES     ESC BACK");
     }
 
-    draw_bottom_bar(fb, ui, w, h, panel, red, dim);
+    screen_end(ui, &L);
 }
 
 static void draw_scene(struct ui *ui)
 {
+    SDL_SetRenderDrawColor(ui->fb.renderer, 0, 0, 0, 255);
+    SDL_RenderClear(ui->fb.renderer);
     if (ui->screen == SCREEN_MEDIA)
         draw_media(ui);
     else if (ui->screen == SCREEN_SYSTEM)
@@ -1959,11 +2410,28 @@ static int handle_global_key(struct ui *ui, int code)
         m->muted = !m->muted;
         audio_apply(ui);
         return 1;
+    /* Media keys work on every screen and follow the active source. */
+    case KEY_NEXTSONG:
+        transport_skip(ui, 1);
+        return 1;
+    case KEY_PREVIOUSSONG:
+        transport_skip(ui, -1);
+        return 1;
+    case KEY_PLAYPAUSE:
+    case KEY_PLAYCD:
+    case KEY_PAUSECD:
+    case KEY_PLAY:
+    case KEY_PAUSE:
+        transport_toggle(ui);
+        return 1;
+    case KEY_STOPCD:
+    case KEY_STOP:
+        transport_stop(ui);
+        return 1;
     default:
         return 0;
     }
 }
-
 
 static void handle_home_key(struct ui *ui, int code, int *dirty)
 {
@@ -1975,24 +2443,27 @@ static void handle_home_key(struct ui *ui, int code, int *dirty)
     case KEY_LEFT:
     case KEY_UP:
         ui->selected = ui->selected > 0 ? ui->selected - 1 : 3;
+        ui->status[0] = '\0';
         *dirty = 1;
         break;
     case KEY_RIGHT:
     case KEY_DOWN:
         ui->selected = ui->selected < 3 ? ui->selected + 1 : 0;
+        ui->status[0] = '\0';
         *dirty = 1;
         break;
     case KEY_ENTER:
     case KEY_KPENTER:
+        ui->status[0] = '\0';
         if (ui->selected == 0) {
             ui->screen = SCREEN_MEDIA;
-            snprintf(ui->status, sizeof(ui->status), "MEDIA");
+            media_rescan(&ui->media);
         } else if (ui->selected == 3) {
             ui->screen = SCREEN_SYSTEM;
             ui->system_page = 0;
             ui->system_selected = 0;
         } else {
-            snprintf(ui->status, sizeof(ui->status), "%s COMING SOON",
+            snprintf(ui->status, sizeof(ui->status), "%s IS COMING SOON",
                      names[ui->selected]);
         }
         *dirty = 1;
@@ -2002,74 +2473,98 @@ static void handle_home_key(struct ui *ui, int code, int *dirty)
     }
 }
 
-static void handle_media_key(struct ui *ui, int code, int *dirty)
+static void media_activate(struct ui *ui)
 {
     struct media *m = &ui->media;
+    const struct entry *e;
 
-    switch (code) {
-    case KEY_ESC:
-    case KEY_BACKSPACE:
-        ui->screen = SCREEN_HOME;
-        *dirty = 1;
-        break;
-    case KEY_UP:
-        if (m->selected > 0)
-            m->selected--;
-        *dirty = 1;
-        break;
-    case KEY_DOWN:
-        if (m->selected < m->track_count)
-            m->selected++;
-        *dirty = 1;
-        break;
-    case KEY_ENTER:
-    case KEY_KPENTER:
-    case KEY_SPACE:
-        if (m->selected == 0) {
-            if (m->source == SRC_BT && m->bt_title[0]) {
-                bt_control(!strcasecmp(m->bt_status, "playing") ? "pause" : "play");
-            } else {
-                bt_start(ui);
-            }
-        } else {
-            local_toggle(ui, m->selected - 1);
-        }
-        *dirty = 1;
-        break;
-    case KEY_LEFT:
-        if (m->selected == 0 && m->source == SRC_BT && m->bt_title[0])
-            bt_control("previous");
+    if (m->selected < 0 || m->selected >= m->entry_count)
+        return;
+    e = &m->entries[m->selected];
+
+    switch (e->type) {
+    case ENT_BT:
+        if (m->source == SRC_BT)
+            transport_toggle(ui);
         else
-            local_skip(ui, -1);
-        *dirty = 1;
+            bt_start(ui);
         break;
-    case KEY_RIGHT:
-        if (m->selected == 0 && m->source == SRC_BT && m->bt_title[0])
-            bt_control("next");
-        else
-            local_skip(ui, 1);
-        *dirty = 1;
+    case ENT_DIR:
+        media_open(m, e->path);
         break;
-    case KEY_M:
-        m->muted = !m->muted;
-        audio_apply(ui);
-        *dirty = 1;
+    case ENT_FILE:
+        play_entry(ui, m->selected);
+        break;
+    case ENT_IMPORT:
+        import_start(ui);
         break;
     default:
         break;
     }
 }
 
+static void handle_media_key(struct ui *ui, int code, int *dirty)
+{
+    struct media *m = &ui->media;
+    int last = imax(m->entry_count - 1, 0);
+
+    switch (code) {
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+        ui->status[0] = '\0';
+        if (!media_up(m))
+            ui->screen = SCREEN_HOME;
+        break;
+    case KEY_UP:
+        m->selected = m->selected > 0 ? m->selected - 1 : last;
+        break;
+    case KEY_DOWN:
+        m->selected = m->selected < last ? m->selected + 1 : 0;
+        break;
+    case KEY_PAGEUP:
+        m->selected = iclamp(m->selected - 8, 0, last);
+        break;
+    case KEY_PAGEDOWN:
+        m->selected = iclamp(m->selected + 8, 0, last);
+        break;
+    case KEY_HOME:
+        m->selected = 0;
+        break;
+    case KEY_END:
+        m->selected = last;
+        break;
+    case KEY_ENTER:
+    case KEY_KPENTER:
+        media_activate(ui);
+        break;
+    case KEY_SPACE:
+        transport_toggle(ui);
+        break;
+    case KEY_LEFT:
+        transport_skip(ui, -1);
+        break;
+    case KEY_RIGHT:
+        transport_skip(ui, 1);
+        break;
+    case KEY_M:
+        m->muted = !m->muted;
+        audio_apply(ui);
+        break;
+    default:
+        return;
+    }
+    *dirty = 1;
+}
+
 static void handle_system_key(struct ui *ui, int code, int *dirty)
 {
+    int enter = code == KEY_ENTER || code == KEY_KPENTER;
+
     if (code == KEY_ESC || code == KEY_BACKSPACE) {
-        if (ui->system_page == 2) {
+        if (ui->system_page != 0)
             ui->system_page = 0;
-        } else if (ui->system_page == 1) {
-            ui->system_page = 0;
-        } else {
+        else
             ui->screen = SCREEN_HOME;
-        }
         *dirty = 1;
         return;
     }
@@ -2081,23 +2576,31 @@ static void handle_system_key(struct ui *ui, int code, int *dirty)
         else if (code == KEY_DOWN)
             ui->system_selected = ui->system_selected < 2
                                 ? ui->system_selected + 1 : 0;
-        else if (code == KEY_ENTER || code == KEY_KPENTER) {
+        else if (enter) {
             if (ui->system_selected == 2) {
                 ui->system_page = 1;
                 system_info_refresh(&ui->system);
             } else {
                 ui->system_action = ui->system_selected == 0 ? 1 : 2;
+                ui->confirm_selected = 0;
                 ui->system_page = 2;
             }
         } else {
             return;
         }
-    } else if (ui->system_page == 2
-               && (code == KEY_ENTER || code == KEY_KPENTER)) {
-        if (ui->system_action == 1)
-            run_cmd("/sbin/reboot");
-        else
-            run_cmd("/sbin/poweroff");
+    } else if (ui->system_page == 2) {
+        if (code == KEY_UP || code == KEY_DOWN) {
+            ui->confirm_selected = !ui->confirm_selected;
+        } else if (enter) {
+            if (ui->confirm_selected == 0)
+                ui->system_page = 0;
+            else if (ui->system_action == 1)
+                run_cmd("/sbin/reboot");
+            else
+                run_cmd("/sbin/poweroff");
+        } else {
+            return;
+        }
     } else {
         return;
     }
@@ -2120,23 +2623,19 @@ static void handle_key(struct ui *ui, int code, int *dirty)
 
 int main(void)
 {
-    struct ui ui;
+    static struct ui ui;
     int inputs[MAX_INPUTS];
     int input_count;
     int dirty = 1;
     double next_draw = 0;
-    double next_bt_refresh = 0;
     double next_media_refresh = 0;
     double next_system_refresh = 0;
 
-    memset(&ui, 0, sizeof(ui));
     ui.screen = SCREEN_HOME;
-    ui.selected = 0;
-    snprintf(ui.status, sizeof(ui.status), "READY");
+    ui.selected = 1;
     ui.media.pid = -1;
     ui.media.source = SRC_NONE;
-    ui.media.local_index = -1;
-    ui.media.selected = 0;
+    ui.media.play_index = -1;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -2154,19 +2653,35 @@ int main(void)
     fprintf(stderr, "owlcaros-ui: %d input device(s)\n", input_count);
 
     audio_init(&ui);
-    media_scan(&ui);
-    fprintf(stderr, "owlcaros-ui: mixer '%s' volume %d, %d track(s)\n",
-            ui.media.mixer, ui.media.volume, ui.media.track_count);
+    mkdir(LIBRARY_DIR, 0755);
+    media_list(&ui.media);
+    fprintf(stderr, "owlcaros-ui: mixer '%s' volume %d, %d source(s)\n",
+            ui.media.mixer, ui.media.volume, ui.media.entry_count);
 
     while (g_running) {
+        struct media *m = &ui.media;
+
         SDL_PumpEvents();
         media_poll(&ui);
 
         double now = mono_now();
-        if (now >= next_bt_refresh) {
-            bt_metadata_refresh(&ui.media);
-            next_bt_refresh = now + 2.0;
-            if (ui.media.source == SRC_BT)
+        if (now >= g_next_bt_refresh) {
+            char before[BT_TEXT + 32];
+            char after[BT_TEXT + 32];
+
+            snprintf(before, sizeof(before), "%d%s%s", m->bt_connected,
+                     m->bt_status, m->bt_title);
+            bt_metadata_refresh(m);
+            snprintf(after, sizeof(after), "%d%s%s", m->bt_connected,
+                     m->bt_status, m->bt_title);
+            g_next_bt_refresh = now + 2.0;
+
+            /* The phone started playing by itself: follow it. */
+            if (m->source == SRC_NONE && bt_is_playing(m)) {
+                m->source = SRC_BT;
+                ui.status[0] = '\0';
+            }
+            if (strcmp(before, after) != 0)
                 dirty = 1;
         }
         if (ui.screen == SCREEN_SYSTEM && ui.system_page == 1
@@ -2175,32 +2690,17 @@ int main(void)
             next_system_refresh = now + 1.0;
             dirty = 1;
         }
-        if (now >= next_media_refresh) {
-            char active_path[TRACK_PATH] = "";
-            int old_selected = ui.media.selected;
-            if (ui.media.source == SRC_LOCAL && ui.media.local_index >= 0
-                && ui.media.local_index < ui.media.track_count)
-                snprintf(active_path, sizeof(active_path), "%s",
-                         ui.media.tracks[ui.media.local_index].path);
-            media_scan(&ui);
-            if (active_path[0]) {
-                ui.media.local_index = -1;
-                for (int i = 0; i < ui.media.track_count; i++) {
-                    if (strcmp(ui.media.tracks[i].path, active_path) == 0) {
-                        ui.media.local_index = i;
-                        break;
-                    }
-                }
-            }
-            ui.media.selected = iclamp(old_selected, 0, ui.media.track_count);
-            next_media_refresh = now + 3.0;
+        if (ui.screen == SCREEN_MEDIA && now >= next_media_refresh) {
+            media_rescan(m);
+            import_refresh(m);
+            next_media_refresh = now + 2.0;
             dirty = 1;
         }
 
         if (dirty || now >= next_draw) {
             draw_scene(&ui);
             dirty = 0;
-            next_draw = now + (ui.screen == SCREEN_MEDIA ? 0.15 : 0.5);
+            next_draw = now + (ui.screen == SCREEN_MEDIA ? 0.25 : 0.5);
         }
 
         fd_set rfds;

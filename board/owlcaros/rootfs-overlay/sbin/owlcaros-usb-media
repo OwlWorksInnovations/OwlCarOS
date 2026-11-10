@@ -17,6 +17,14 @@ case "$MDEV" in
     sd[a-z][0-9]*) ;;
     *) exit 0 ;;
 esac
+# The drive OwlCarOS runs from is not removable media: skip its boot, root
+# and music partitions.
+rootdisk=$(/sbin/owlcaros-rootdisk 2>/dev/null)
+if [ -n "$rootdisk" ]; then
+    case "$MDEV" in
+        "$rootdisk"*) exit 0 ;;
+    esac
+fi
 device="/dev/$MDEV"
 [ -b "$device" ] || exit 0
 type=$(blkid -o value -s TYPE "$device" 2>/dev/null)
@@ -27,5 +35,13 @@ esac
 target="$MEDIA_ROOT/$MDEV"
 [ -d "$target" ] || mkdir -p "$target"
 if ! mountpoint -q "$target"; then
-    mount -t "$type" -o ro,nosuid,nodev,noexec "$device" "$target" 2>/dev/null || rmdir "$target" 2>/dev/null || true
+    # UTF-8 file names, so accented titles display and copy correctly.
+    case "$type" in
+        vfat|fat|msdos) opts=ro,nosuid,nodev,noexec,utf8=1 ;;
+        exfat|ntfs3) opts=ro,nosuid,nodev,noexec,iocharset=utf8 ;;
+        *) opts=ro,nosuid,nodev,noexec ;;
+    esac
+    mount -t "$type" -o "$opts" "$device" "$target" 2>/dev/null \
+        || mount -t "$type" -o ro,nosuid,nodev,noexec "$device" "$target" 2>/dev/null \
+        || rmdir "$target" 2>/dev/null || true
 fi

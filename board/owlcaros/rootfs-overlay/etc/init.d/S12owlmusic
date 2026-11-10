@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# Music library storage.
+#
+# The root filesystem is small, so music lives on its own FAT32 partition
+# labelled OWLMUSIC, mounted at /root/Music. FAT32 lets a Windows or Mac
+# computer open the same partition and drop music straight onto it.
+#
+# On the first boot from a drive that still has unused space after the
+# root partition (a freshly flashed USB stick), the partition is created
+# in that space. It starts 8 GiB into the drive, well clear of the OS
+# image, so flashing a newer OwlCarOS image keeps the music: the next boot
+# finds the old filesystem again and reuses it without formatting.
+#
+# A system installed with the installer has no free space left (root fills
+# the disk), so nothing is created and /root/Music is a plain folder.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+LABEL=OWLMUSIC
+MOUNTPOINT=/root/Music
+LOG=/var/log/owlmusic.log
+FAT_TYPE=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7   # "Microsoft basic data"
+MIN_START=16777216      # 8 GiB in 512-byte sectors
+MIN_FREE=2097152        # only bother when at least 1 GiB is unused
+
+log() {
+    echo "$*" >> "$LOG"
+}
+
+music_partition() {
+    lsblk -nrpo NAME,PARTLABEL,LABEL "/dev/$1" 2>/dev/null \
+        | awk -v l="$LABEL" '$2 == l || $3 == l { print $1; exit }'
+}
+
+create_partition() {
+    disk=$1
+
+    [ "$(lsblk -dnro PTTYPE "/dev/$disk" 2>/dev/null)" = "gpt" ] || return 1
+    [ "$(cat "/sys/block/$disk/queue/logical_block_size")" = "512" ] || return 1
+
+    total=$(cat "/sys/block/$disk/size")
+    last_end=0
+    for p in /sys/block/"$disk"/"$disk"*; do
+        [ -r "$p/start" ] || continue
+        end=$(( $(cat "$p/start") + $(cat "$p/size") ))
+        [ "$end" -gt "$last_end" ] && last_end=$end
+    done
+    [ "$last_end" -gt 0 ] || return 1
+
+    # Prefer the fixed 8 GiB offset; on a small drive start right after
+    # the root partition instead.
+    start=$(( (last_end + 2047) / 2048 * 2048 ))
+    if [ "$start" -lt "$MIN_START" ] \
+        && [ $(( total - MIN_START )) -ge "$MIN_FREE" ]; then
+        start=$MIN_START
+    fi
+    if [ $(( total - start )) -lt "$MIN_FREE" ]; then
+        log "No room for a music partition on $disk"
+        return 1
+    fi
+
+    log "Creating $LABEL on $disk at sector $start"
+    printf 'start=%s, type=%s, name="%s"\n' "$start" "$FAT_TYPE" "$LABEL" \
+        | sfdisk --append --force --no-reread --wipe never \
+                 --wipe-partitions never "/dev/$disk" >> "$LOG" 2>&1 \
+        || return 1
+    sync
+    return 0
+}
+
+start() {
+    printf 'Starting music library: '
+    mkdir -p "$MOUNTPOINT"
+
+    if mountpoint -q "$MOUNTPOINT"; then
+        echo "ALREADY MOUNTED"
+        return 0
+    fi
+
+    disk=$(/sbin/owlcaros-rootdisk) || {
+        echo "NO ROOT DISK"
+        return 0
+    }
+
+    part=$(music_partition "$disk")
+    if [ -z "$part" ] && create_partition "$disk"; then
+        # The kernel learns about the new partition without a reboot.
+        partx -a "/dev/$disk" >> "$LOG" 2>&1 || true
+        i=0
+        while [ "$i" -lt 10 ]; do
+            part=$(music_partition "$disk")
+            [ -n "$part" ] && [ -b "$part" ] && break
+            part=""
+            sleep 0.5
+            i=$((i + 1))
+        done
+        if [ -z "$part" ]; then
+            log "Partition created; it becomes usable after the next boot"
+            echo "REBOOT NEEDED"
+            return 0
+        fi
+    fi
+
+    if [ -z "$part" ]; then
+        echo "USING ROOT FILESYSTEM"
+        return 0
+    fi
+
+    # Reuse an existing FAT filesystem; format only an empty partition.
+    if [ "$(blkid -o value -s TYPE "$part" 2>/dev/null)" != "vfat" ]; then
+        log "Formatting $part as FAT32"
+        mkfs.fat -F 32 -n "$LABEL" "$part" >> "$LOG" 2>&1 || {
+            echo "FORMAT FAILED"
+            return 1
+        }
+    fi
+
+    if mount -t vfat -o rw,noatime,utf8=1,flush "$part" "$MOUNTPOINT" \
+        >> "$LOG" 2>&1; then
+        echo "OK"
+        return 0
+    fi
+    echo "MOUNT FAILED"
+    return 1
+}
+
+stop() {
+    printf 'Stopping music library: '
+    sync
+    umount "$MOUNTPOINT" 2>/dev/null
+    echo "OK"
+}
+
+case "$1" in
+    start|stop)
+        "$1"
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
