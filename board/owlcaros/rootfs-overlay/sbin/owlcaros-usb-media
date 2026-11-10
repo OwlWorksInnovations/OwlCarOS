@@ -25,6 +25,13 @@ if [ -n "$rootdisk" ]; then
         "$rootdisk"*) exit 0 ;;
     esac
 fi
+# Only real USB storage is removable media; internal SATA drives use the
+# same sdX names. Also stand back while the installer repartitions a drive.
+case "$(readlink -f "/sys/class/block/$MDEV" 2>/dev/null)" in
+    */usb[0-9]*/*) ;;
+    *) exit 0 ;;
+esac
+[ -d /run/owlcaros-install.lock ] && exit 0
 device="/dev/$MDEV"
 [ -b "$device" ] || exit 0
 type=$(blkid -o value -s TYPE "$device" 2>/dev/null)

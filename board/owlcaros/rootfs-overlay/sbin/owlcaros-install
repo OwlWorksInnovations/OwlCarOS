@@ -1,0 +1,211 @@
+#!/bin/sh
+# OwlCarOS installer backend, driven by the Settings screen.
+#
+#   owlcaros-install list          print the drives that can be installed to,
+#                                  one per line: /dev/name|size GB|model|bus
+#   owlcaros-install run /dev/X    erase /dev/X and install OwlCarOS on it
+#
+# "run" works from the running system: it partitions the drive, copies the
+# EFI boot partition, formats a root filesystem that fills the rest of the
+# drive, copies the system files and the music library, and points GRUB at
+# the new root. Progress is one line in a status file that the UI shows.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+STATUS=/run/owlcaros-install.status
+LOCK=/run/owlcaros-install.lock      # also pauses USB auto-mounting
+LOG=/var/log/owlcaros-install.log
+SRC=/run/owlcaros-install-src
+DST=/run/owlcaros-install-dst
+EFI=/run/owlcaros-install-efi
+MUSIC=/root/Music
+MIN_BYTES=4294967296                 # 4 GiB
+
+status() {
+    printf '%s\n' "$*" > "$STATUS.tmp" && mv "$STATUS.tmp" "$STATUS"
+    echo "$(date '+%H:%M:%S') $*" >> "$LOG"
+}
+
+trim() {
+    sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+list_disks() {
+    rootdisk=$(/sbin/owlcaros-rootdisk) || return 1
+    lsblk -dnbo NAME,SIZE,TYPE,RO 2>/dev/null | while read -r name size type ro; do
+        [ "$type" = "disk" ] || continue
+        [ "$name" != "$rootdisk" ] || continue
+        [ "$ro" = "0" ] || continue
+        [ "$size" -ge "$MIN_BYTES" ] 2>/dev/null || continue
+        model=$(lsblk -dno MODEL "/dev/$name" 2>/dev/null | trim)
+        [ -n "$model" ] || model="Drive"
+        tran=$(lsblk -dno TRAN "/dev/$name" 2>/dev/null | trim)
+        gb=$(awk -v b="$size" 'BEGIN { printf "%.0f", b / 1000000000 }')
+        printf '/dev/%s|%s|%s|%s\n' "$name" "$gb" "$model" "$tran"
+    done
+}
+
+cleanup() {
+    for mp in "$SRC" "$EFI" "$DST"; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null
+        fi
+        rmdir "$mp" 2>/dev/null
+    done
+    rmdir "$LOCK" 2>/dev/null
+}
+
+die() {
+    status "FAILED - $*"
+    exit 1
+}
+
+# Nth partition (1-based) of a disk, as a /dev path.
+partition() {
+    lsblk -nrpo NAME,TYPE "$1" 2>/dev/null \
+        | awk -v want="$2" '$2 == "part" { n++; if (n == want) { print $1; exit } }'
+}
+
+used_kb() {
+    df -k -P "$1" 2>/dev/null | awk 'NR == 2 { print $3 }'
+}
+
+# Copy a tree in the background and report "LABEL nn%" while it runs.
+copy_tree() {
+    from=$1
+    to=$2
+    label=$3
+    total=$(du -sk "$from" 2>/dev/null | awk '{ print $1 }')
+    [ "${total:-0}" -gt 0 ] || total=1
+    base=$(used_kb "$DST")
+
+    cp -a "$from"/. "$to"/ >> "$LOG" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(used_kb "$DST")
+        pct=$(( (${now:-0} - ${base:-0}) * 100 / total ))
+        [ "$pct" -lt 0 ] && pct=0
+        [ "$pct" -gt 99 ] && pct=99
+        status "$label $pct%"
+        sleep 1
+    done
+    wait "$pid"
+}
+
+run_install() {
+    target=$1
+    : > "$LOG"
+
+    [ -b "$target" ] || die "DRIVE NOT FOUND"
+    rootdisk=$(/sbin/owlcaros-rootdisk) || die "CANNOT FIND THE RUNNING SYSTEM"
+    [ "$target" != "/dev/$rootdisk" ] || die "THAT IS THE DRIVE OWLCAROS RUNS FROM"
+    list_disks | grep -q "^$target|" || die "DRIVE CANNOT BE USED"
+
+    # One installation at a time.
+    mkdir "$LOCK" 2>/dev/null || exit 0
+    trap cleanup EXIT
+    trap 'exit 1' INT TERM
+    mkdir -p "$SRC" "$DST" "$EFI"
+
+    status "PREPARING DRIVE"
+    src_boot=$(partition "/dev/$rootdisk" 1)
+    [ -b "$src_boot" ] || die "BOOT PARTITION NOT FOUND"
+    boot_sectors=$(blockdev --getsz "$src_boot" 2>/dev/null)
+    [ -n "$boot_sectors" ] || die "CANNOT READ THE BOOT PARTITION"
+
+    # Release anything of the target that is mounted.
+    lsblk -nro MOUNTPOINT "$target" 2>/dev/null | while read -r mp; do
+        [ -n "$mp" ] || continue
+        umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null
+    done
+    if lsblk -nro MOUNTPOINT "$target" 2>/dev/null | grep -q '[^[:space:]]'; then
+        die "DRIVE IS IN USE"
+    fi
+
+    sfdisk --wipe always --wipe-partitions always "$target" >> "$LOG" 2>&1 <<PARTS
+label: gpt
+unit: sectors
+start=2048, size=$boot_sectors, type=U, name="boot"
+type=L, name="rootfs"
+PARTS
+    [ "$?" -eq 0 ] || die "COULD NOT PARTITION THE DRIVE"
+    sync
+    partprobe "$target" >> "$LOG" 2>&1
+
+    t_boot=""
+    t_root=""
+    attempt=0
+    while [ "$attempt" -lt 15 ]; do
+        t_boot=$(partition "$target" 1)
+        t_root=$(partition "$target" 2)
+        [ -b "$t_boot" ] && [ -b "$t_root" ] && break
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    [ -b "$t_boot" ] && [ -b "$t_root" ] || die "NEW PARTITIONS DID NOT APPEAR"
+
+    status "COPYING BOOT FILES"
+    dd if="$src_boot" of="$t_boot" bs=4M conv=fsync >> "$LOG" 2>&1 \
+        || die "COULD NOT COPY THE BOOT PARTITION"
+
+    status "FORMATTING"
+    mkfs.ext4 -q -F -L rootfs "$t_root" >> "$LOG" 2>&1 \
+        || die "COULD NOT FORMAT THE DRIVE"
+    mount -t ext4 "$t_root" "$DST" >> "$LOG" 2>&1 \
+        || die "COULD NOT MOUNT THE NEW SYSTEM"
+
+    # A plain bind mount of / shows the root filesystem alone, without
+    # /proc, /run, the music partition or anything else mounted on it.
+    mount -o bind / "$SRC" >> "$LOG" 2>&1 || die "COULD NOT READ THE RUNNING SYSTEM"
+
+    status "COPYING SYSTEM 0%"
+    copy_tree "$SRC" "$DST" "COPYING SYSTEM" || die "COPYING THE SYSTEM FAILED"
+    umount "$SRC" 2>/dev/null
+
+    # Carry the music library over when it lives on its own partition.
+    if mountpoint -q "$MUSIC" && [ -n "$(ls -A "$MUSIC" 2>/dev/null)" ]; then
+        music_kb=$(du -sk "$MUSIC" 2>/dev/null | awk '{ print $1 }')
+        free_kb=$(df -k -P "$DST" | awk 'NR == 2 { print $4 }')
+        if [ $(( ${music_kb:-0} + 524288 )) -lt "${free_kb:-0}" ]; then
+            mkdir -p "$DST$MUSIC"
+            status "COPYING MUSIC 0%"
+            copy_tree "$MUSIC" "$DST$MUSIC" "COPYING MUSIC" \
+                || echo "music copy reported errors" >> "$LOG"
+        else
+            echo "music library does not fit, skipped" >> "$LOG"
+        fi
+    fi
+
+    status "FINISHING"
+    sync
+    umount "$DST" >> "$LOG" 2>&1 || die "COULD NOT FINISH WRITING THE SYSTEM"
+
+    partuuid=$(blkid -s PARTUUID -o value "$t_root" 2>/dev/null | sed -n '1p')
+    [ -n "$partuuid" ] || die "CANNOT READ THE NEW PARTITION ID"
+    mount "$t_boot" "$EFI" >> "$LOG" 2>&1 || die "COULD NOT MOUNT THE NEW BOOT PARTITION"
+    cfg="$EFI/EFI/BOOT/grub.cfg"
+    [ -f "$cfg" ] || die "BOOT CONFIGURATION IS MISSING"
+    # The installed system boots its own root and offers no installer.
+    sed -i -e '/^menuentry "OwlCarOS Installer/,/^}/d' \
+           -e "s/root=PARTUUID=[^ ]*/root=PARTUUID=$partuuid/g" "$cfg" \
+        || die "COULD NOT UPDATE THE BOOT CONFIGURATION"
+    grep -q "root=PARTUUID=$partuuid" "$cfg" || die "BOOT CONFIGURATION DID NOT UPDATE"
+    sync
+    umount "$EFI" >> "$LOG" 2>&1
+
+    status "DONE"
+}
+
+case "$1" in
+    list)
+        list_disks
+        ;;
+    run)
+        [ -n "$2" ] || { echo "Usage: $0 run /dev/DISK" >&2; exit 1; }
+        run_install "$2"
+        ;;
+    *)
+        echo "Usage: $0 {list|run /dev/DISK}" >&2
+        exit 1
+        ;;
+esac

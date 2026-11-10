@@ -48,6 +48,14 @@
 #define SCREEN_MEDIA  1
 #define SCREEN_SYSTEM 2
 
+/* Pages of the Settings screen. */
+#define SYS_MENU            0
+#define SYS_MONITOR         1
+#define SYS_CONFIRM         2   /* reboot / shutdown */
+#define SYS_INSTALL_PICK    3   /* choose the target drive */
+#define SYS_INSTALL_CONFIRM 4
+#define SYS_INSTALL_RUN     5   /* progress and result */
+
 #define SRC_NONE      0
 #define SRC_LOCAL     1
 #define SRC_BT        2
@@ -187,15 +195,31 @@ struct sys_info {
     int top_count;
 };
 
+#define MAX_DISKS 8
+
+/* A drive the installer may erase. */
+struct install_disk {
+    char dev[64];
+    char label[128];
+};
+
+struct install {
+    struct install_disk disks[MAX_DISKS];
+    int count;
+    int selected;
+    char status[96];     /* last line reported by the install job */
+};
+
 struct ui {
     struct fb fb;
     int ttyfd;
     int screen;
     int selected;
     int system_selected;
-    int system_page; /* 0=menu, 1=monitor, 2=confirm */
+    int system_page; /* SYS_MENU ... SYS_INSTALL_RUN */
     int system_action; /* 1=reboot, 2=shutdown */
     int confirm_selected; /* 0=cancel, 1=do it */
+    struct install install;
     struct sys_info system;
     char status[64];
     struct media media;
@@ -2267,34 +2291,140 @@ static void draw_meter(struct fb *fb, int x, int y, int w, int percent)
     fill_rect(fb, x, y, w * iclamp(percent, 0, 100) / 100, 10, C_BRIGHT);
 }
 
+/*
+ * Installer front end. The work is done by /sbin/owlcaros-install; the UI
+ * lists the drives it offers, starts it and shows its one-line status.
+ */
+#define INSTALL_TOOL   "/sbin/owlcaros-install"
+#define INSTALL_STATUS "/run/owlcaros-install.status"
+
+static void install_scan(struct install *in)
+{
+    FILE *p = popen(INSTALL_TOOL " list 2>/dev/null", "r");
+    char line[256];
+
+    in->count = 0;
+    in->selected = 0;
+    if (p == NULL)
+        return;
+
+    /* Each line: /dev/name|size in GB|model|bus */
+    while (in->count < MAX_DISKS && fgets(line, sizeof(line), p) != NULL) {
+        struct install_disk *d = &in->disks[in->count];
+        char *dev = line;
+        char *gb;
+        char *model;
+        char *bus;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        gb = strchr(dev, '|');
+        if (gb == NULL)
+            continue;
+        *gb++ = '\0';
+        model = strchr(gb, '|');
+        if (model == NULL)
+            continue;
+        *model++ = '\0';
+        bus = strchr(model, '|');
+        if (bus != NULL)
+            *bus++ = '\0';
+
+        snprintf(d->dev, sizeof(d->dev), "%s", dev);
+        snprintf(d->label, sizeof(d->label), "%.60s - %.8s GB%s (%.20s)",
+                 model, gb,
+                 bus != NULL && strcmp(bus, "usb") == 0 ? " USB" : "", dev);
+        in->count++;
+    }
+    pclose(p);
+}
+
+static void install_refresh(struct install *in)
+{
+    FILE *f = fopen(INSTALL_STATUS, "r");
+
+    if (f == NULL)
+        return;
+    if (fgets(in->status, sizeof(in->status), f) != NULL)
+        in->status[strcspn(in->status, "\r\n")] = '\0';
+    fclose(f);
+}
+
+static void install_begin(struct install *in)
+{
+    unlink(INSTALL_STATUS);
+    snprintf(in->status, sizeof(in->status), "STARTING");
+    run_cmd("%s run '%s' >/dev/null 2>&1 &", INSTALL_TOOL,
+            in->disks[in->selected].dev);
+}
+
+static int install_done(const struct install *in)
+{
+    return strncmp(in->status, "DONE", 4) == 0;
+}
+
+static int install_failed(const struct install *in)
+{
+    return strncmp(in->status, "FAILED", 6) == 0;
+}
+
+/* "COPYING SYSTEM 42%" -> 42, or -1 when the status carries no number. */
+static int install_percent(const struct install *in)
+{
+    const char *pct = strchr(in->status, '%');
+    const char *digits = pct;
+
+    if (pct == NULL)
+        return -1;
+    while (digits > in->status && digits[-1] >= '0' && digits[-1] <= '9')
+        digits--;
+    return digits == pct ? -1 : atoi(digits);
+}
+
+/* Heading above a centred list, with an optional line under it. */
+static void draw_heading(struct fb *fb, const struct layout *L, int list_y,
+                         const char *heading, const char *sub)
+{
+    int x = L->list_x + 14;
+    int iw = L->list_w - 28;
+    int h2 = font_height(L->scale);
+    int y = list_y - 18 - font_height(3);
+
+    if (sub != NULL && sub[0] != '\0') {
+        y -= h2 + 4;
+        draw_text_ellipsis(fb, x, y + font_height(3) + 4, iw, sub, L->scale,
+                           C_RED);
+    }
+    draw_text_ellipsis(fb, x, y, iw, heading, 3, C_BRIGHT);
+}
+
 static void draw_system(struct ui *ui)
 {
     struct fb *fb = &ui->fb;
+    struct install *in = &ui->install;
     struct layout L;
-    char text[128];
+    char text[160];
     int h2, h3;
 
     layout_init(fb, &L);
     h2 = font_height(L.scale);
     h3 = font_height(3);
 
-    if (ui->system_page == 0) {
-        static const char *const labels[3] = {
+    if (ui->system_page == SYS_MENU) {
+        static const char *const labels[4] = {
             "REBOOT - Restart OwlCarOS",
             "SHUTDOWN - Power Off",
-            "SYSTEM INFO - CPU, Memory and Processes"
+            "SYSTEM INFO - CPU, Memory and Processes",
+            "INSTALL - Copy OwlCarOS to an Internal Drive"
         };
-        int list_y = L.fy + L.fh / 2 - (L.row_h * 3) / 2;
+        int list_y = L.fy + L.fh / 2 - (L.row_h * 4) / 2;
 
         screen_begin(ui, &L, "SETTINGS",
                      list_y + ui->system_selected * L.row_h + L.row_h / 2);
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 4; i++)
             draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
                      i == ui->system_selected);
         draw_hint(fb, &L, "UP / DOWN SELECT     ENTER OPEN     ESC BACK");
-    } else if (ui->system_page == 2) {
-        const char *question = ui->system_action == 1
-                             ? "Reboot OwlCarOS?" : "Shut down OwlCarOS?";
+    } else if (ui->system_page == SYS_CONFIRM) {
         const char *labels[2];
         int list_y = L.fy + L.fh / 2 - L.row_h;
 
@@ -2303,11 +2433,88 @@ static void draw_system(struct ui *ui)
 
         screen_begin(ui, &L, "SETTINGS",
                      list_y + ui->confirm_selected * L.row_h + L.row_h / 2);
-        draw_text(fb, L.list_x + 14, list_y - h3 - 18, question, 3, C_BRIGHT);
+        draw_heading(fb, &L, list_y,
+                     ui->system_action == 1 ? "Reboot OwlCarOS?"
+                                            : "Shut down OwlCarOS?", NULL);
         for (int i = 0; i < 2; i++)
             draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
                      i == ui->confirm_selected);
         draw_hint(fb, &L, "UP / DOWN SELECT     ENTER CONFIRM     ESC CANCEL");
+    } else if (ui->system_page == SYS_INSTALL_PICK) {
+        int rows = imax(in->count, 1);
+        int list_y = L.fy + L.fh / 2 - (L.row_h * rows) / 2 + L.row_h;
+
+        screen_begin(ui, &L, "INSTALL",
+                     list_y + in->selected * L.row_h + L.row_h / 2);
+        if (in->count > 0) {
+            draw_heading(fb, &L, list_y, "Install to which drive?",
+                         "Everything on the drive you choose will be erased.");
+            for (int i = 0; i < in->count; i++)
+                draw_row(fb, &L, list_y + i * L.row_h, in->disks[i].label,
+                         NULL, i == in->selected);
+            draw_hint(fb, &L, "UP / DOWN SELECT     ENTER CHOOSE     ESC BACK");
+        } else {
+            draw_heading(fb, &L, list_y, "No drive to install to",
+                         "No other drive of 4 GB or more was found.");
+            draw_hint(fb, &L, "ESC BACK");
+        }
+    } else if (ui->system_page == SYS_INSTALL_CONFIRM) {
+        static const char *const labels[2] = {
+            "CANCEL - Keep the Drive As It Is",
+            "ERASE THE DRIVE AND INSTALL"
+        };
+        int list_y = L.fy + L.fh / 2;
+
+        screen_begin(ui, &L, "INSTALL",
+                     list_y + ui->confirm_selected * L.row_h + L.row_h / 2);
+        draw_heading(fb, &L, list_y, "Erase this drive?",
+                     in->disks[in->selected].label);
+        for (int i = 0; i < 2; i++)
+            draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
+                     i == ui->confirm_selected);
+        draw_hint(fb, &L, "ALL FILES ON THIS DRIVE WILL BE LOST     ESC CANCEL");
+    } else if (ui->system_page == SYS_INSTALL_RUN) {
+        int x = L.list_x + 14;
+        int iw = L.list_w - 28;
+        int list_y = L.fy + L.fh / 2;
+
+        if (install_done(in)) {
+            static const char *const labels[2] = {
+                "SHUT DOWN NOW",
+                "BACK TO SETTINGS"
+            };
+
+            screen_begin(ui, &L, "INSTALL",
+                         list_y + ui->confirm_selected * L.row_h
+                         + L.row_h / 2);
+            draw_heading(fb, &L, list_y, "Installation complete",
+                         "Shut down, remove the USB stick, then power on.");
+            for (int i = 0; i < 2; i++)
+                draw_row(fb, &L, list_y + i * L.row_h, labels[i], NULL,
+                         i == ui->confirm_selected);
+            draw_hint(fb, &L, "UP / DOWN SELECT     ENTER CONFIRM");
+        } else if (install_failed(in)) {
+            screen_begin(ui, &L, "INSTALL", list_y);
+            draw_heading(fb, &L, list_y, "Installation failed",
+                         in->status + (strncmp(in->status, "FAILED - ", 9)
+                                       == 0 ? 9 : 0));
+            draw_text_ellipsis(fb, x, list_y + 6, iw,
+                               "Details are in /var/log/owlcaros-install.log",
+                               L.scale, C_DIM);
+            draw_hint(fb, &L, "ESC BACK");
+        } else {
+            int percent = install_percent(in);
+
+            screen_begin(ui, &L, "INSTALL", list_y);
+            draw_heading(fb, &L, list_y, "Installing OwlCarOS",
+                         in->disks[in->selected].label);
+            draw_text_ellipsis(fb, x, list_y + 6, iw, in->status, L.scale,
+                               C_BRIGHT);
+            if (percent >= 0)
+                draw_meter(fb, x, list_y + 6 + h2 + 10, iw, percent);
+            draw_hint(fb, &L,
+                      "DO NOT POWER OFF OR REMOVE THE USB STICK");
+        }
     } else {
         const struct sys_info *si = &ui->system;
         int line_h = h2 + 8;
@@ -2460,7 +2667,7 @@ static void handle_home_key(struct ui *ui, int code, int *dirty)
             media_rescan(&ui->media);
         } else if (ui->selected == 3) {
             ui->screen = SCREEN_SYSTEM;
-            ui->system_page = 0;
+            ui->system_page = SYS_MENU;
             ui->system_selected = 0;
         } else {
             snprintf(ui->status, sizeof(ui->status), "%s IS COMING SOON",
@@ -2558,51 +2765,104 @@ static void handle_media_key(struct ui *ui, int code, int *dirty)
 
 static void handle_system_key(struct ui *ui, int code, int *dirty)
 {
+    struct install *in = &ui->install;
     int enter = code == KEY_ENTER || code == KEY_KPENTER;
+    int back = code == KEY_ESC || code == KEY_BACKSPACE;
+    int updown = code == KEY_UP || code == KEY_DOWN;
 
-    if (code == KEY_ESC || code == KEY_BACKSPACE) {
-        if (ui->system_page != 0)
-            ui->system_page = 0;
-        else
+    switch (ui->system_page) {
+    case SYS_MENU:
+        if (back)
             ui->screen = SCREEN_HOME;
-        *dirty = 1;
-        return;
-    }
-
-    if (ui->system_page == 0) {
-        if (code == KEY_UP)
+        else if (code == KEY_UP)
             ui->system_selected = ui->system_selected > 0
-                                ? ui->system_selected - 1 : 2;
+                                ? ui->system_selected - 1 : 3;
         else if (code == KEY_DOWN)
-            ui->system_selected = ui->system_selected < 2
+            ui->system_selected = ui->system_selected < 3
                                 ? ui->system_selected + 1 : 0;
-        else if (enter) {
-            if (ui->system_selected == 2) {
-                ui->system_page = 1;
-                system_info_refresh(&ui->system);
-            } else {
-                ui->system_action = ui->system_selected == 0 ? 1 : 2;
-                ui->confirm_selected = 0;
-                ui->system_page = 2;
-            }
+        else if (enter && ui->system_selected == 2) {
+            ui->system_page = SYS_MONITOR;
+            system_info_refresh(&ui->system);
+        } else if (enter && ui->system_selected == 3) {
+            install_scan(in);
+            ui->system_page = SYS_INSTALL_PICK;
+        } else if (enter) {
+            ui->system_action = ui->system_selected == 0 ? 1 : 2;
+            ui->confirm_selected = 0;
+            ui->system_page = SYS_CONFIRM;
         } else {
             return;
         }
-    } else if (ui->system_page == 2) {
-        if (code == KEY_UP || code == KEY_DOWN) {
+        break;
+
+    case SYS_CONFIRM:
+        if (back || (enter && ui->confirm_selected == 0))
+            ui->system_page = SYS_MENU;
+        else if (updown)
+            ui->confirm_selected = !ui->confirm_selected;
+        else if (enter)
+            run_cmd(ui->system_action == 1 ? "/sbin/reboot"
+                                           : "/sbin/poweroff");
+        else
+            return;
+        break;
+
+    case SYS_INSTALL_PICK:
+        if (back) {
+            ui->system_page = SYS_MENU;
+        } else if (in->count == 0) {
+            return;
+        } else if (code == KEY_UP) {
+            in->selected = in->selected > 0 ? in->selected - 1
+                                            : in->count - 1;
+        } else if (code == KEY_DOWN) {
+            in->selected = in->selected < in->count - 1 ? in->selected + 1
+                                                        : 0;
+        } else if (enter) {
+            ui->confirm_selected = 0;
+            ui->system_page = SYS_INSTALL_CONFIRM;
+        } else {
+            return;
+        }
+        break;
+
+    case SYS_INSTALL_CONFIRM:
+        if (back || (enter && ui->confirm_selected == 0)) {
+            ui->system_page = SYS_INSTALL_PICK;
+        } else if (updown) {
             ui->confirm_selected = !ui->confirm_selected;
         } else if (enter) {
-            if (ui->confirm_selected == 0)
-                ui->system_page = 0;
-            else if (ui->system_action == 1)
-                run_cmd("/sbin/reboot");
-            else
-                run_cmd("/sbin/poweroff");
+            install_begin(in);
+            ui->confirm_selected = 0;
+            ui->system_page = SYS_INSTALL_RUN;
         } else {
             return;
         }
-    } else {
-        return;
+        break;
+
+    case SYS_INSTALL_RUN:
+        if (install_done(in)) {
+            if (updown)
+                ui->confirm_selected = !ui->confirm_selected;
+            else if (enter && ui->confirm_selected == 0)
+                run_cmd("/sbin/poweroff");
+            else if (enter || back)
+                ui->system_page = SYS_MENU;
+            else
+                return;
+        } else if (install_failed(in) && (back || enter)) {
+            ui->system_page = SYS_MENU;
+        } else {
+            /* Running: there is nothing to cancel safely. */
+            return;
+        }
+        break;
+
+    default: /* SYS_MONITOR */
+        if (!back)
+            return;
+        ui->system_page = SYS_MENU;
+        break;
     }
     *dirty = 1;
 }
@@ -2684,10 +2944,17 @@ int main(void)
             if (strcmp(before, after) != 0)
                 dirty = 1;
         }
-        if (ui.screen == SCREEN_SYSTEM && ui.system_page == 1
+        if (ui.screen == SCREEN_SYSTEM && ui.system_page == SYS_MONITOR
             && now >= next_system_refresh) {
             system_info_refresh(&ui.system);
             next_system_refresh = now + 1.0;
+            dirty = 1;
+        }
+        if (ui.screen == SCREEN_SYSTEM
+            && ui.system_page == SYS_INSTALL_RUN
+            && now >= next_system_refresh) {
+            install_refresh(&ui.install);
+            next_system_refresh = now + 0.5;
             dirty = 1;
         }
         if (ui.screen == SCREEN_MEDIA && now >= next_media_refresh) {

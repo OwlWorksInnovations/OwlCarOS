@@ -10,7 +10,7 @@ The system currently includes:
 
 - Buildroot 2026.02.3, Linux 6.18.7, BusyBox and glibc
 - Mesa 26.0.1 OpenGL ES/EGL with the i915, iris and crocus Gallium drivers plus softpipe, using LLVM 21.1.8
-- UEFI boot through GRUB, with an automated disk installer
+- UEFI boot through GRUB, with an installer in the Settings screen and a console installer in the GRUB menu
 - Wi-Fi drivers and wpa_supplicant
 - BlueZ Bluetooth pairing and A2DP audio playback through bluealsa
 - System menu with confirmed reboot/shutdown actions and a live CPU, memory, uptime, load and process monitor
@@ -22,13 +22,13 @@ The system currently includes:
 - Audio utilities and a startup mixer level adjustment
 - Battery percentage from Linux power-supply devices that identify as batteries; shows `--%` if no battery is detected
 
-Every screen shares the red Audi TT (8N) inspired radio styling of the main menu: the lens frame, one palette and a list whose selected row is a solid bar. The installer is intended to install to an internal disk while protecting the boot USB. It asks the user to type the target device path before erasing it. Installation to a real disk still needs testing.
+Every screen shares the red Audi TT (8N) inspired radio styling of the main menu: the lens frame, one palette and a list whose selected row is a solid bar. Installation to a real disk still needs testing.
 
 ## Controls
 
 On the home screen, use Up/Down to select Media, Navigation, Phone or Settings, then Enter to open. Navigation and Phone are currently placeholders.
 
-Settings offers Reboot, Shutdown and System Info. Reboot and Shutdown open a confirmation list that starts on Cancel; move to the action and press Enter to run it. System Info shows live CPU and memory use, load average, uptime, task count and the five processes using the most memory.
+Settings offers Reboot, Shutdown, System Info and Install. Reboot and Shutdown open a confirmation list that starts on Cancel; move to the action and press Enter to run it. System Info shows live CPU and memory use, load average, uptime, task count and the five processes using the most memory.
 
 ### Media
 
@@ -64,15 +64,31 @@ Music is kept in `/root/Music`. On the first boot from a freshly flashed USB sti
 1. **From a computer.** Plug the OwlCarOS stick into a Windows, macOS or Linux computer. The `OWLMUSIC` drive appears next to the boot partition; copy folders of MP3 or WAV files onto it.
 2. **From another USB drive, in the car.** Plug in a drive with music, open Media and choose **Copy USB Music to Library**. WAV and MP3 files are copied with their folders; files already in the library are skipped, and copying stops when the library is full. Progress is shown on that row.
 
-USB drives can also be played directly without copying. They are mounted read-only at `/run/media/<device>` when inserted and unmounted when removed. FAT, ext2/3/4, exFAT and NTFS3 are supported. The drive OwlCarOS itself runs from is never listed as USB media.
+USB drives can also be played directly without copying. They are mounted read-only at `/run/media/<device>` when inserted and unmounted when removed. FAT, ext2/3/4, exFAT and NTFS3 are supported. Only USB storage is mounted this way; internal drives and the drive OwlCarOS runs from are never listed as USB media.
 
 The music partition starts 8 GiB into the stick, clear of the OS image, so flashing a newer OwlCarOS image keeps the music: the next boot finds the existing filesystem and reuses it. A system installed to an internal disk has no spare space after the root partition, so `/root/Music` is a normal folder on the root filesystem there. Details are logged to `/var/log/owlmusic.log`.
 
-## Installing to a hard drive
+## Installing to an internal drive
 
-Boot the USB image and launch the installer from its GRUB menu. The installer lists available disks and excludes the boot USB. It requires typing the exact confirmation string for the selected device before it repartitions the disk, copies the system, expands the root filesystem, and updates the installed boot entry.
+Boot from the USB stick, open **Settings** and choose **Install - Copy OwlCarOS to an Internal Drive**.
 
-**The selected disk is erased.** Check the displayed model and size carefully. The installer has not yet been validated on a real target disk.
+1. Pick the drive. Every drive of 4 GB or more is listed with its model and size, except the stick OwlCarOS is running from. SATA, NVMe and eMMC drives are supported.
+2. Confirm. The list starts on Cancel; move to **Erase the Drive and Install** and press Enter.
+3. Wait. The screen shows each step and a progress bar. Do not power off or remove the stick.
+4. When it reports **Installation complete**, choose **Shut Down Now**, remove the stick and power on.
+
+**The selected drive is erased completely.** Check the model and size before confirming.
+
+The installer creates an EFI boot partition and a root partition that fills the rest of the drive, copies the running system onto it, copies the music library from the stick if it fits, and points GRUB at the new root partition. The work is done by `/sbin/owlcaros-install`, which logs to `/var/log/owlcaros-install.log`.
+
+The original console installer is still available from the stick's GRUB menu as **OwlCarOS Installer (Console)**. Both have been tested in QEMU only.
+
+### Music on an installed system
+
+On an internal drive the library is the folder `/root/Music` on the root partition, which has the whole drive to itself. Music gets there in two ways:
+
+- The installer copies whatever is in the stick's library at install time.
+- Later, plug in any USB drive with music, open Media and choose **Copy USB Music to Library**. This works the same as on the stick.
 
 ## Audio notes
 
@@ -91,8 +107,7 @@ For headless QEMU use `-audiodev none,id=aud0`. The interface runs on `tty1`; us
 - Test Bluetooth track info and skip/pause with the target phone (Spotify and YouTube Music), across pause, track changes and disconnects
 - Test music-partition creation on the target USB stick, and copying music onto it from Windows
 - Test USB insertion/removal, direct playback and library import from FAT, exFAT and NTFS3 drives on target hardware
-- Validate the installer on a spare internal disk and verify its boot entry
-- Build a graphical installer interface
+- Validate the Settings installer on a spare internal disk and verify that it boots
 - Wi-Fi hotspot connectivity
 - Online maps and navigation
 - Functional Phone screen and additional system settings
@@ -127,6 +142,7 @@ OwlCarOS/
     │   └── storage.config
     └── rootfs-overlay/
         ├── sbin/
+        │   ├── owlcaros-install
         │   ├── owlcaros-installer-init
         │   ├── owlcaros-music-import
         │   ├── owlcaros-rootdisk
