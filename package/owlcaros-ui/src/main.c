@@ -2881,12 +2881,48 @@ static void handle_key(struct ui *ui, int code, int *dirty)
         handle_home_key(ui, code, dirty);
 }
 
+/*
+ * The GRUB menu starts the graphical installer with owlcaros.installer=1 on
+ * the kernel command line. It then opens the Settings installer on boot
+ * instead of the home screen.
+ */
+static int installer_boot_requested(void)
+{
+    static const char key[] = "owlcaros.installer";
+    size_t key_len = sizeof(key) - 1;
+    char line[1024];
+    FILE *f = fopen("/proc/cmdline", "r");
+    char *p;
+    int found = 0;
+
+    if (f == NULL)
+        return 0;
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    for (p = line; (p = strstr(p, key)) != NULL; p += key_len) {
+        char after = p[key_len];
+
+        if ((p == line || p[-1] == ' ' || p[-1] == '\t')
+            && (after == '=' || after == ' ' || after == '\n'
+                || after == '\0')) {
+            found = 1;
+            break;
+        }
+    }
+    return found;
+}
+
 int main(void)
 {
     static struct ui ui;
     int inputs[MAX_INPUTS];
     int input_count;
     int dirty = 1;
+    int installer = installer_boot_requested();
     double next_draw = 0;
     double next_media_refresh = 0;
     double next_system_refresh = 0;
@@ -2896,6 +2932,12 @@ int main(void)
     ui.media.pid = -1;
     ui.media.source = SRC_NONE;
     ui.media.play_index = -1;
+
+    if (installer) {
+        ui.screen = SCREEN_SYSTEM;
+        ui.system_selected = 3;
+        ui.system_page = SYS_INSTALL_PICK;
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -2917,6 +2959,12 @@ int main(void)
     media_list(&ui.media);
     fprintf(stderr, "owlcaros-ui: mixer '%s' volume %d, %d source(s)\n",
             ui.media.mixer, ui.media.volume, ui.media.entry_count);
+
+    if (installer) {
+        install_scan(&ui.install);
+        fprintf(stderr, "owlcaros-ui: installer mode, %d drive(s)\n",
+                ui.install.count);
+    }
 
     while (g_running) {
         struct media *m = &ui.media;
@@ -2955,6 +3003,13 @@ int main(void)
             && now >= next_system_refresh) {
             install_refresh(&ui.install);
             next_system_refresh = now + 0.5;
+            dirty = 1;
+        }
+        /* A drive that is still being probed appears on its own. */
+        if (ui.screen == SCREEN_SYSTEM && ui.system_page == SYS_INSTALL_PICK
+            && ui.install.count == 0 && now >= next_system_refresh) {
+            install_scan(&ui.install);
+            next_system_refresh = now + 2.0;
             dirty = 1;
         }
         if (ui.screen == SCREEN_MEDIA && now >= next_media_refresh) {

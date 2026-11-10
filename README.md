@@ -81,7 +81,7 @@ Boot from the USB stick, open **Settings** and choose **Install - Copy OwlCarOS 
 
 The installer creates an EFI boot partition and a root partition that fills the rest of the drive, copies the running system onto it, copies the music library from the stick if it fits, and points GRUB at the new root partition. The work is done by `/sbin/owlcaros-install`, which logs to `/var/log/owlcaros-install.log`.
 
-The original console installer is still available from the stick's GRUB menu as **OwlCarOS Installer (Console)**. Both have been tested in QEMU only.
+The stick's GRUB menu also starts this installer directly as **OwlCarOS Installer (Graphical)**, which boots into the Settings install screen instead of the home screen. The original console installer is still there as **OwlCarOS Installer (Console)**. Both have been tested in QEMU only.
 
 ### Music on an installed system
 
